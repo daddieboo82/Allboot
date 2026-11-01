@@ -122,7 +122,14 @@ case "$action" in
     ;;
   info)
     disk="$2"
-    case "$disk" in disk[0-9]*) ;; *) echo "Invalid disk identifier" >&2; exit 2 ;; esac
+    case "$disk" in
+      disk[0-9]*) ;;
+      *) echo "Invalid disk identifier" >&2; exit 2 ;;
+    esac
+    number=$(printf '%s' "$disk" | /usr/bin/cut -c 5-)
+    case "$number" in
+      *[!0-9]*|'') echo "Invalid disk identifier" >&2; exit 2 ;;
+    esac
     /usr/sbin/diskutil info -plist "/dev/$disk" | /usr/bin/plutil -convert json -o - -
     ;;
   boot)
@@ -144,6 +151,13 @@ esac
         return Err("The helper could not be verified after installation.".into());
     }
     Ok(path.to_string_lossy().to_string())
+}
+#[cfg(any(target_os = "macos", test))]
+fn is_whole_macos_disk_identifier(identifier: &str) -> bool {
+    let Some(number) = identifier.strip_prefix("disk") else {
+        return false;
+    };
+    !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
 }
 #[cfg(any(target_os = "macos", test))]
 fn parent_disk_identifier(volume_id: &str) -> Option<String> {
@@ -267,9 +281,7 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                 Some(v) => v,
                 None => continue,
             };
-            if !identifier.starts_with("disk")
-                || !identifier[4..].chars().all(|c| c.is_ascii_digit())
-            {
+            if !is_whole_macos_disk_identifier(identifier) {
                 continue;
             }
             let detail = match run(&["info", identifier]) {
@@ -301,7 +313,10 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                 .get("TotalSize")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let number = identifier[4..].parse::<u32>().unwrap_or(0);
+            let number = match identifier[4..].parse::<u32>() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
             let name = detail
                 .get("MediaName")
                 .and_then(|v| v.as_str())
@@ -626,6 +641,16 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    #[test]
+    fn macos_whole_disk_identifier_rejects_partition_and_malformed_names() {
+        assert!(is_whole_macos_disk_identifier("disk0"));
+        assert!(is_whole_macos_disk_identifier("disk23"));
+        assert!(!is_whole_macos_disk_identifier("disk"));
+        assert!(!is_whole_macos_disk_identifier("disk3s1"));
+        assert!(!is_whole_macos_disk_identifier("disk3junk"));
+        assert!(!is_whole_macos_disk_identifier("rdisk3"));
+        assert!(!is_whole_macos_disk_identifier("disk-1"));
+    }
     #[test]
     fn parses_macos_startup_volume_parent_disk() {
         assert_eq!(parent_disk_identifier("disk3s5"), Some("disk3".into()));
