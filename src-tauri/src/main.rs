@@ -537,6 +537,22 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         "Not identified as a supported macOS installer image.".into()
     };
 
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Could not restart image integrity verification: {e}"))?;
+    let mut verification_hasher = Sha256::new();
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| {
+            format!("Could not verify image integrity after header inspection: {e}")
+        })?;
+        if count == 0 {
+            break;
+        }
+        verification_hasher.update(&buffer[..count]);
+    }
+    let verification_sha256 = format!("{:x}", verification_hasher.finalize());
+    if !verification_sha256.eq_ignore_ascii_case(&sha256) {
+        return Err("The image contents changed during inspection. Select the file again and repeat inspection. Nothing was written.".into());
+    }
     let final_handle_metadata = file
         .metadata()
         .map_err(|e| format!("Could not perform final image integrity check: {e}"))?;
