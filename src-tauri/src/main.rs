@@ -203,6 +203,31 @@ where
     Ok(written)
 }
 
+struct HashingReader<'a, R> {
+    inner: &'a mut R,
+    hasher: Sha256,
+}
+impl<'a, R: Read> HashingReader<'a, R> {
+    fn new(inner: &'a mut R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+    fn finish(self) -> String {
+        format!("{:x}", self.hasher.finalize())
+    }
+}
+impl<R: Read> Read for HashingReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        if count > 0 {
+            self.hasher.update(&buffer[..count]);
+        }
+        Ok(count)
+    }
+}
+
 #[allow(dead_code)]
 fn write_verified_stream<R, D, C, P>(
     source: &mut R,
@@ -237,13 +262,21 @@ where
     destination
         .seek(SeekFrom::Start(0))
         .map_err(|e| format!("Could not position the destination: {e}"))?;
+    let mut hashing_source = HashingReader::new(source);
     let written = stream_image(
-        source,
+        &mut hashing_source,
         destination,
         image_size,
         is_cancelled,
         report_progress,
     )?;
+    let streamed_sha256 = hashing_source.finish();
+    if !streamed_sha256.eq_ignore_ascii_case(image_sha256.trim()) {
+        return Err(format!(
+            "The source image changed between preflight and streaming (expected {}, streamed {}). The destination was not verified; do not boot from it.",
+            image_sha256.trim(), streamed_sha256
+        ));
+    }
     if written != image_size {
         return Err("The destination write did not complete the expected image length.".into());
     }
@@ -1771,6 +1804,31 @@ mod tests {
         assert_eq!(destination.get_ref(), bytes);
         assert!(!progress.is_empty());
         assert_eq!(progress.last().copied(), Some(bytes.len() as u64));
+    }
+
+    #[test]
+    fn verified_write_pipeline_detects_source_bytes_changed_after_preflight() {
+        let expected_bytes = b"image bytes from preflight";
+        let changed_bytes = b"image bytes from preflighX";
+        assert_eq!(expected_bytes.len(), changed_bytes.len());
+        let expected_hash = format!("{:x}", Sha256::digest(expected_bytes));
+        let phrase = erase_confirmation_phrase(9, "USB-TEST-9", &expected_hash);
+        let mut source = std::io::Cursor::new(changed_bytes.to_vec());
+        let mut destination = std::io::Cursor::new(vec![0_u8; changed_bytes.len()]);
+        let error = write_verified_stream(
+            &mut source,
+            &mut destination,
+            changed_bytes.len() as u64,
+            changed_bytes.len() as u64,
+            9,
+            "USB-TEST-9",
+            &expected_hash,
+            &phrase,
+            || false,
+            |_| {},
+        )
+        .expect_err("changed source bytes must not pass verification");
+        assert!(error.contains("source image changed"));
     }
 
     #[test]
