@@ -289,6 +289,70 @@ fn validate_erase_confirmation(
     Ok(())
 }
 
+fn open_verified_source_image(
+    path: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<File, String> {
+    if expected_sha256.trim().len() != 64
+        || !expected_sha256
+            .trim()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("The expected image SHA-256 is invalid. Inspect the image again.".into());
+    }
+    let mut file =
+        File::open(path).map_err(|e| format!("Could not reopen the selected image: {e}"))?;
+    let before = file
+        .metadata()
+        .map_err(|e| format!("Could not inspect the selected image file: {e}"))?;
+    if !before.is_file() || before.len() != expected_size {
+        return Err("The selected image is no longer a regular file of the inspected size. Nothing was written.".into());
+    }
+    const CHUNK_SIZE: usize = 1024 * 1024;
+    let mut buffer = vec![0_u8; CHUNK_SIZE];
+    let mut remaining = expected_size;
+    let mut hasher = Sha256::new();
+    while remaining > 0 {
+        let requested = remaining.min(CHUNK_SIZE as u64) as usize;
+        let count = file
+            .read(&mut buffer[..requested])
+            .map_err(|e| format!("Could not verify the selected image: {e}"))?;
+        if count == 0 {
+            return Err(
+                "The selected image ended during its integrity check. Nothing was written.".into(),
+            );
+        }
+        hasher.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    let mut extra = [0_u8; 1];
+    if file
+        .read(&mut extra)
+        .map_err(|e| format!("Could not finish image integrity check: {e}"))?
+        != 0
+    {
+        return Err(
+            "The selected image grew during its integrity check. Nothing was written.".into(),
+        );
+    }
+    let after = file
+        .metadata()
+        .map_err(|e| format!("Could not re-check the selected image: {e}"))?;
+    if !file_metadata_unchanged(&before, &after) {
+        return Err(
+            "The selected image changed during its integrity check. Nothing was written.".into(),
+        );
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected_sha256.trim()) {
+        return Err("The selected image SHA-256 changed since inspection. Inspect it again. Nothing was written.".into());
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Could not rewind the verified image: {e}"))?;
+    Ok(file)
+}
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
@@ -1462,6 +1526,41 @@ mod tests {
             phrase,
             erase_confirmation_phrase(4, "usb-serial-123", &image_hash)
         );
+    }
+
+    #[test]
+    fn source_image_gate_reopens_verifies_and_rewinds_exact_file() {
+        let path =
+            std::env::temp_dir().join(format!("allboot-source-{}-test.img", std::process::id()));
+        let bytes = b"AllBoot source image verification fixture";
+        std::fs::write(&path, bytes).expect("write temporary image");
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let mut file =
+            open_verified_source_image(path.to_str().unwrap(), bytes.len() as u64, &hash)
+                .expect("matching image should verify");
+        let mut first = [0_u8; 7];
+        file.read_exact(&mut first)
+            .expect("verified handle should be rewound");
+        assert_eq!(&first, b"AllBoot");
+        assert!(open_verified_source_image(
+            path.to_str().unwrap(),
+            bytes.len() as u64,
+            &"0".repeat(64)
+        )
+        .is_err());
+        assert!(open_verified_source_image(
+            path.to_str().unwrap(),
+            (bytes.len() + 1) as u64,
+            &hash
+        )
+        .is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn source_image_gate_rejects_non_file_paths() {
+        let path = std::env::temp_dir();
+        assert!(open_verified_source_image(path.to_str().unwrap(), 0, &"0".repeat(64)).is_err());
     }
 
     #[test]
