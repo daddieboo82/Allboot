@@ -489,7 +489,7 @@ fn preflight_write(
 ) -> Result<PreflightReport, String> {
     #[cfg(target_os = "windows")]
     {
-        let script = "$ErrorActionPreference='Stop'; $n=[uint32]$env:ALLBOOT_DISK_NUMBER; $disk=Get-Disk -Number $n; $disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem | ConvertTo-Json -Compress";
+        let script = "$ErrorActionPreference='Stop'; $helper=$env:ALLBOOT_HELPER_PATH; if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) { throw 'AllBoot Drive Helper is missing. Reinstall it before preparation.' }; $inventory = & $helper | ConvertFrom-Json; $n=[uint32]$env:ALLBOOT_DISK_NUMBER; $disk = @($inventory) | Where-Object { [uint32]$_.Number -eq $n } | Select-Object -First 1; if ($null -eq $disk) { throw 'The selected disk is no longer present in the helper inventory.' }; $disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem | ConvertTo-Json -Compress";
         let output = Command::new("powershell.exe")
             .env("ALLBOOT_DISK_NUMBER", disk_number.to_string())
             .env(
