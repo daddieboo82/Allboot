@@ -212,6 +212,10 @@ fn parent_disk_identifier(volume_id: &str) -> Option<String> {
     Some(format!("disk{}", digits))
 }
 #[cfg(any(target_os = "macos", test))]
+fn is_usb_bus_protocol(protocol: &str) -> bool {
+    protocol.trim().eq_ignore_ascii_case("USB")
+}
+
 fn stable_macos_disk_identity(detail: &serde_json::Value) -> Option<String> {
     let serial = detail
         .get("SerialNumber")
@@ -340,7 +344,10 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                 .get("BusProtocol")
                 .or_else(|| detail.get("Protocol"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("External");
+                .unwrap_or("");
+            if !is_usb_bus_protocol(bus) {
+                continue;
+            }
             let size = detail
                 .get("TotalSize")
                 .and_then(|v| v.as_u64())
@@ -358,6 +365,9 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                 Some(value) => value,
                 None => continue,
             };
+            if !is_usb_bus_protocol(bus) {
+                return Err("Safety check blocked this device because macOS does not identify it as USB storage. Nothing was written.".into());
+            }
             let serial = detail
                 .get("SerialNumber")
                 .and_then(|v| v.as_str())
@@ -621,7 +631,10 @@ fn preflight_write(
             .get("BusProtocol")
             .or_else(|| detail.get("Protocol"))
             .and_then(|v| v.as_str())
-            .unwrap_or("External");
+            .unwrap_or("");
+        if !is_usb_bus_protocol(bus) {
+            return Err("Safety check blocked this device because macOS does not identify it as USB storage. Nothing was written.".into());
+        }
         let serial = detail
             .get("SerialNumber")
             .and_then(|v| v.as_str())
@@ -695,6 +708,16 @@ mod tests {
         assert!(!helper_version_supported(
             "# not ALLBOOT_DRIVE_HELPER_VERSION=1"
         ));
+    }
+    #[test]
+    fn macos_drive_filter_accepts_only_usb_bus_protocol() {
+        assert!(is_usb_bus_protocol("USB"));
+        assert!(is_usb_bus_protocol("usb"));
+        assert!(is_usb_bus_protocol(" USB "));
+        assert!(!is_usb_bus_protocol("Thunderbolt"));
+        assert!(!is_usb_bus_protocol("SATA"));
+        assert!(!is_usb_bus_protocol("External"));
+        assert!(!is_usb_bus_protocol(""));
     }
     #[test]
     fn macos_whole_disk_identifier_rejects_partition_and_malformed_names() {
