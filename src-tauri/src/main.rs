@@ -91,6 +91,20 @@ fn drive_helper_path() -> Result<std::path::PathBuf, String> {
 
 const HELPER_VERSION_MARKER: &str = "ALLBOOT_DRIVE_HELPER_VERSION=1";
 
+fn verified_drive_helper_path() -> Result<std::path::PathBuf, String> {
+    let path = drive_helper_path()?;
+    let contents = std::fs::read_to_string(&path).map_err(|_| {
+        "AllBoot Drive Helper is missing or unreadable. Reinstall it before drive detection."
+            .to_string()
+    })?;
+    if !helper_version_supported(&contents) {
+        return Err(
+            "AllBoot Drive Helper has an unsupported version. Reinstall it before drive detection."
+                .into(),
+        );
+    }
+    Ok(path)
+}
 fn helper_version_supported(contents: &str) -> bool {
     contents
         .lines()
@@ -227,7 +241,7 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
         let output = Command::new("powershell.exe")
             .env(
                 "ALLBOOT_HELPER_PATH",
-                drive_helper_path()?.to_string_lossy().to_string(),
+                verified_drive_helper_path()?.to_string_lossy().to_string(),
             )
             .args([
                 "-NoLogo",
@@ -269,7 +283,7 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let helper = drive_helper_path()?;
+        let helper = verified_drive_helper_path()?;
         let run = |args: &[&str]| -> Result<serde_json::Value, String> {
             let output = Command::new("sh")
                 .arg(&helper)
@@ -494,7 +508,7 @@ fn preflight_write(
             .env("ALLBOOT_DISK_NUMBER", disk_number.to_string())
             .env(
                 "ALLBOOT_HELPER_PATH",
-                drive_helper_path()?.to_string_lossy().to_string(),
+                verified_drive_helper_path()?.to_string_lossy().to_string(),
             )
             .args([
                 "-NoLogo",
@@ -556,7 +570,7 @@ fn preflight_write(
     }
     #[cfg(target_os = "macos")]
     {
-        let helper = drive_helper_path()?;
+        let helper = verified_drive_helper_path()?;
         let disk_id = format!("disk{}", disk_number);
         let run_info = |action: &str, id: Option<&str>| -> Result<serde_json::Value, String> {
             let mut command = Command::new("sh");
