@@ -59,6 +59,7 @@ struct PreflightReport {
     image_name: String,
     image_size_bytes: u64,
     image_sha256: String,
+    write_readiness: String,
     confirmation_phrase: String,
     checks: Vec<String>,
 }
@@ -121,6 +122,32 @@ fn windows_disk_is_eligible(
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
+fn image_write_readiness(
+    extension: &str,
+    el_torito_boot_record: bool,
+    udif_signature: bool,
+) -> &'static str {
+    if udif_signature || extension.eq_ignore_ascii_case("dmg") {
+        "Not ready: macOS DMG requires Apple's installer-specific workflow, which is not implemented."
+    } else if matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "wim" | "esd" | "vhd" | "vhdx"
+    ) {
+        "Not ready: this is a container format, not a directly writable boot image."
+    } else if extension.eq_ignore_ascii_case("iso") && el_torito_boot_record {
+        "Candidate only: El Torito boot record detected. Target operating-system and firmware compatibility still need validation; writing is not implemented."
+    } else if extension.eq_ignore_ascii_case("iso") {
+        "Not ready: no El Torito boot record was detected in this ISO."
+    } else if matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "img" | "raw" | "bin"
+    ) {
+        "Not ready: raw-image boot structure and partition layout are not yet validated by AllBoot."
+    } else {
+        "Not ready: image format is not supported by a verified writing workflow."
+    }
+}
+
 fn image_write_compatibility(
     extension: &str,
     iso9660_signature: bool,
@@ -690,6 +717,12 @@ fn preflight_write(
         if image.size_bytes > disk_size {
             return Err(format!("The image is larger than the selected USB drive ({} bytes available, {} bytes required). Nothing was written.", disk_size, image.size_bytes));
         }
+        let write_readiness = image_write_readiness(
+            &image.extension,
+            image.el_torito_boot_record,
+            image.udif_signature,
+        )
+        .to_string();
         Ok(PreflightReport {
             disk_number,
             drive_name: disk
@@ -699,6 +732,7 @@ fn preflight_write(
             image_name: image.name,
             image_size_bytes: image.size_bytes,
             image_sha256: image.sha256,
+            write_readiness,
             confirmation_phrase: format!("ERASE DISK {}", disk_number),
             checks: vec![
                 "Destination re-queried immediately before preparation".into(),
@@ -795,6 +829,12 @@ fn preflight_write(
         if image.size_bytes > disk_size {
             return Err(format!("The image is larger than the selected external disk ({} bytes available, {} bytes required). Nothing was written.", disk_size, image.size_bytes));
         }
+        let write_readiness = image_write_readiness(
+            &image.extension,
+            image.el_torito_boot_record,
+            image.udif_signature,
+        )
+        .to_string();
         Ok(PreflightReport {
             disk_number,
             drive_name: detail
@@ -806,6 +846,7 @@ fn preflight_write(
             image_name: image.name,
             image_size_bytes: image.size_bytes,
             image_sha256: image.sha256,
+            write_readiness,
             confirmation_phrase: format!("ERASE DISK {}", disk_number),
             checks: vec![
                 "External physical disk re-queried immediately before preparation".into(),
@@ -831,6 +872,17 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn write_readiness_never_confuses_preflight_with_write_support() {
+        assert!(image_write_readiness("iso", true, false).starts_with("Candidate only"));
+        assert!(image_write_readiness("iso", false, false).contains("no El Torito"));
+        assert!(image_write_readiness("dmg", false, true).contains("Apple's installer"));
+        assert!(image_write_readiness("wim", false, false).contains("container format"));
+        assert!(image_write_readiness("vhdx", false, false).contains("container format"));
+        assert!(image_write_readiness("img", false, false).contains("partition layout"));
+        assert!(image_write_readiness("unknown", false, false).contains("not supported"));
+    }
 
     #[test]
     fn image_write_compatibility_distinguishes_raw_candidates_and_containers() {
