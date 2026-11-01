@@ -1717,6 +1717,24 @@ mod tests {
     }
 
     #[test]
+    fn image_stream_rejects_short_source_without_claiming_completion() {
+        let mut source = std::io::Cursor::new(b"short".to_vec());
+        let mut destination = std::io::Cursor::new(Vec::new());
+        let result = stream_image(&mut source, &mut destination, 10, || false, |_| {});
+        assert!(result.unwrap_err().contains("ended early"));
+        assert_eq!(destination.get_ref(), b"short");
+    }
+
+    #[test]
+    fn image_stream_rejects_source_that_grows_past_inspected_size() {
+        let mut source = std::io::Cursor::new(b"longer".to_vec());
+        let mut destination = std::io::Cursor::new(Vec::new());
+        let result = stream_image(&mut source, &mut destination, 5, || false, |_| {});
+        assert!(result.unwrap_err().contains("grew"));
+        assert_eq!(destination.get_ref(), b"longe");
+    }
+
+    #[test]
     fn verified_write_pipeline_propagates_cancellation() {
         let bytes = vec![0x5A_u8; 1024 * 1024 + 8];
         let hash = format!("{:x}", Sha256::digest(&bytes));
