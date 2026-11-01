@@ -48,6 +48,7 @@ struct ImageInspection {
     macos_candidate: bool,
     sha256: String,
     bootability: String,
+    write_compatibility: String,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,6 +121,33 @@ fn windows_disk_is_eligible(
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
+fn image_write_compatibility(
+    extension: &str,
+    iso9660_signature: bool,
+    el_torito_boot_record: bool,
+    udif_signature: bool,
+) -> &'static str {
+    if udif_signature || extension.eq_ignore_ascii_case("dmg") {
+        "macOS installer workflow required; do not raw-write this DMG"
+    } else if matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "wim" | "esd" | "vhd" | "vhdx"
+    ) {
+        "container format; not eligible for direct raw USB writing"
+    } else if el_torito_boot_record {
+        "raw-image candidate; target firmware and operating-system compatibility still require validation"
+    } else if iso9660_signature {
+        "ISO 9660 detected without El Torito boot record; bootability is unconfirmed"
+    } else if matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "img" | "raw" | "bin"
+    ) {
+        "raw-image candidate; bootability and partition layout are unverified"
+    } else {
+        "unverified format; direct USB writing is not recommended"
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn drive_helper_source() -> &'static str {
     r#"# ALLBOOT_DRIVE_HELPER_VERSION=1
@@ -575,6 +603,14 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         return Err("The image changed during inspection. Select it again and repeat inspection. Nothing was written.".into());
     }
 
+    let write_compatibility = image_write_compatibility(
+        &extension,
+        iso9660_signature,
+        el_torito_boot_record,
+        udif_signature,
+    )
+    .to_string();
+
     Ok(ImageInspection {
         name,
         path,
@@ -587,6 +623,7 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         macos_candidate,
         sha256,
         bootability,
+        write_compatibility,
     })
 }
 
@@ -794,6 +831,21 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn image_write_compatibility_distinguishes_raw_candidates_and_containers() {
+        assert!(
+            image_write_compatibility("iso", true, true, false).starts_with("raw-image candidate")
+        );
+        assert!(image_write_compatibility("dmg", false, false, true)
+            .contains("macOS installer workflow"));
+        assert!(image_write_compatibility("wim", false, false, false).contains("not eligible"));
+        assert!(image_write_compatibility("vhdx", false, false, false).contains("not eligible"));
+        assert!(image_write_compatibility("iso", true, false, false).contains("unconfirmed"));
+        assert!(image_write_compatibility("img", false, false, false)
+            .starts_with("raw-image candidate"));
+        assert!(image_write_compatibility("unknown", false, false, false).starts_with("unverified"));
+    }
 
     #[test]
     fn drive_helper_installation_requires_exact_shipped_source() {
