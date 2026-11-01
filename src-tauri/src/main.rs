@@ -506,6 +506,17 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         "Not identified as a supported macOS installer image.".into()
     };
 
+    let final_handle_metadata = file
+        .metadata()
+        .map_err(|e| format!("Could not perform final image integrity check: {e}"))?;
+    let final_path_metadata = std::fs::metadata(image_path)
+        .map_err(|e| format!("The selected image path changed during inspection: {e}"))?;
+    if !file_metadata_unchanged(&metadata, &final_handle_metadata)
+        || !file_metadata_unchanged(&metadata, &final_path_metadata)
+    {
+        return Err("The image changed during inspection. Select it again and repeat inspection. Nothing was written.".into());
+    }
+
     Ok(ImageInspection {
         name,
         path,
