@@ -164,7 +164,7 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
             let whole = detail.get("Whole").and_then(|v| v.as_bool()).unwrap_or(false);
             let actual_id = detail.get("DeviceIdentifier").and_then(|v| v.as_str()).unwrap_or(identifier);
             let is_boot = actual_id == boot_disk;
-            if internal || !whole { continue; }
+            if internal || !whole || is_boot { continue; }
             let bus = detail.get("BusProtocol").or_else(|| detail.get("Protocol")).and_then(|v| v.as_str()).unwrap_or("External");
             let size = detail.get("TotalSize").and_then(|v| v.as_u64()).unwrap_or(0);
             let number = identifier[4..].parse::<u32>().unwrap_or(0);
