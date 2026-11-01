@@ -204,6 +204,58 @@ where
 }
 
 #[allow(dead_code)]
+fn write_verified_stream<R, D, C, P>(
+    source: &mut R,
+    destination: &mut D,
+    image_size: u64,
+    destination_size: u64,
+    disk_number: u32,
+    stable_identity: &str,
+    image_sha256: &str,
+    supplied_confirmation: &str,
+    is_cancelled: C,
+    report_progress: P,
+) -> Result<String, String>
+where
+    R: Read,
+    D: Read + Write + Seek,
+    C: FnMut() -> bool,
+    P: FnMut(u64),
+{
+    validate_erase_confirmation(
+        disk_number,
+        stable_identity,
+        image_sha256,
+        supplied_confirmation,
+    )?;
+    if image_size == 0 || destination_size < image_size {
+        return Err(format!("Destination capacity is insufficient or invalid ({} bytes available, {} bytes required). Nothing was written.", destination_size, image_size));
+    }
+    if image_sha256.len() != 64 || !image_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("The expected image SHA-256 is invalid. Nothing was written.".into());
+    }
+    destination
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Could not position the destination: {e}"))?;
+    let written = stream_image(
+        source,
+        destination,
+        image_size,
+        is_cancelled,
+        report_progress,
+    )?;
+    if written != image_size {
+        return Err("The destination write did not complete the expected image length.".into());
+    }
+    destination
+        .flush()
+        .map_err(|e| format!("Could not flush the destination: {e}"))?;
+    destination
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("Could not rewind the destination for verification: {e}"))?;
+    verify_image_readback(destination, image_size, image_sha256)
+}
+
 fn verify_image_readback<R: Read>(
     reader: &mut R,
     expected_size: u64,
@@ -1598,6 +1650,93 @@ mod tests {
                 .unwrap_err()
                 .contains("more data")
         );
+    }
+
+    #[test]
+    fn verified_write_pipeline_streams_and_reads_back_exact_image() {
+        let bytes = b"AllBoot verified writer integration fixture";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let phrase = erase_confirmation_phrase(7, "USB-TEST-7", &hash);
+        let mut source = std::io::Cursor::new(bytes.to_vec());
+        let mut destination = std::io::Cursor::new(vec![0_u8; bytes.len()]);
+        let mut progress = Vec::new();
+        let result = write_verified_stream(
+            &mut source,
+            &mut destination,
+            bytes.len() as u64,
+            bytes.len() as u64,
+            7,
+            "USB-TEST-7",
+            &hash,
+            &phrase,
+            || false,
+            |n| progress.push(n),
+        )
+        .expect("verified pipeline should complete");
+        assert_eq!(result, hash);
+        assert_eq!(destination.get_ref(), bytes);
+        assert!(!progress.is_empty());
+        assert_eq!(progress.last().copied(), Some(bytes.len() as u64));
+    }
+
+    #[test]
+    fn verified_write_pipeline_rejects_wrong_confirmation_and_small_target_before_writing() {
+        let bytes = b"must remain unchanged";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let phrase = erase_confirmation_phrase(7, "USB-TEST-7", &hash);
+        let mut source = std::io::Cursor::new(bytes.to_vec());
+        let mut destination = std::io::Cursor::new(vec![0xA5_u8; bytes.len()]);
+        assert!(write_verified_stream(
+            &mut source,
+            &mut destination,
+            bytes.len() as u64,
+            bytes.len() as u64 - 1,
+            7,
+            "USB-TEST-7",
+            &hash,
+            &phrase,
+            || false,
+            |_| {}
+        )
+        .is_err());
+        assert_eq!(destination.get_ref(), &vec![0xA5_u8; bytes.len()]);
+        assert!(write_verified_stream(
+            &mut source,
+            &mut destination,
+            bytes.len() as u64,
+            bytes.len() as u64,
+            7,
+            "USB-TEST-7",
+            &hash,
+            "STALE CONFIRMATION",
+            || false,
+            |_| {}
+        )
+        .is_err());
+        assert_eq!(destination.get_ref(), &vec![0xA5_u8; bytes.len()]);
+    }
+
+    #[test]
+    fn verified_write_pipeline_propagates_cancellation() {
+        let bytes = vec![0x5A_u8; 1024 * 1024 + 8];
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let phrase = erase_confirmation_phrase(8, "USB-TEST-8", &hash);
+        let mut source = std::io::Cursor::new(bytes.clone());
+        let mut destination = std::io::Cursor::new(vec![0_u8; bytes.len()]);
+        let result = write_verified_stream(
+            &mut source,
+            &mut destination,
+            bytes.len() as u64,
+            bytes.len() as u64,
+            8,
+            "USB-TEST-8",
+            &hash,
+            &phrase,
+            || true,
+            |_| {},
+        );
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert!(destination.get_ref().iter().all(|byte| *byte == 0));
     }
 
     #[test]
