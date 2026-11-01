@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     process::Command,
 };
@@ -147,6 +147,60 @@ fn valid_el_torito_catalog(boot_record: &[u8], catalog: &[u8]) -> bool {
         initial_entry[11],
     ]);
     checksum == 0 && initial_entry[0] == 0x88 && media_type <= 4 && sector_count > 0 && load_rba > 0
+}
+
+#[allow(dead_code)]
+fn stream_image<R, W, C, P>(
+    reader: &mut R,
+    writer: &mut W,
+    expected_size: u64,
+    mut is_cancelled: C,
+    mut report_progress: P,
+) -> Result<u64, String>
+where
+    R: Read,
+    W: Write,
+    C: FnMut() -> bool,
+    P: FnMut(u64),
+{
+    const CHUNK_SIZE: usize = 1024 * 1024;
+    let mut buffer = vec![0_u8; CHUNK_SIZE];
+    let mut written = 0_u64;
+    while written < expected_size {
+        if is_cancelled() {
+            return Err(format!("Image streaming cancelled after {written} bytes."));
+        }
+        let remaining = expected_size - written;
+        let requested = usize::try_from(remaining.min(CHUNK_SIZE as u64))
+            .map_err(|_| "Image chunk size is not representable on this platform.".to_string())?;
+        let count = reader
+            .read(&mut buffer[..requested])
+            .map_err(|e| format!("Could not read source image: {e}"))?;
+        if count == 0 {
+            return Err(format!(
+                "Source image ended early: expected {expected_size} bytes, read {written}."
+            ));
+        }
+        writer
+            .write_all(&buffer[..count])
+            .map_err(|e| format!("Could not write image chunk: {e}"))?;
+        written = written
+            .checked_add(count as u64)
+            .ok_or_else(|| "Image byte counter overflowed.".to_string())?;
+        report_progress(written);
+    }
+    let mut extra = [0_u8; 1];
+    if reader
+        .read(&mut extra)
+        .map_err(|e| format!("Could not verify source image length: {e}"))?
+        != 0
+    {
+        return Err("Source image grew after its expected size was recorded.".into());
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("Could not flush image output: {e}"))?;
+    Ok(written)
 }
 
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
@@ -1284,6 +1338,65 @@ mod tests {
                 "startup disk must not be selectable"
             );
         }
+    }
+
+    #[test]
+    fn image_stream_copies_exact_bytes_and_reports_monotonic_progress() {
+        let source = vec![0x5A_u8; 2 * 1024 * 1024 + 17];
+        let mut reader = std::io::Cursor::new(source.clone());
+        let mut output = Vec::new();
+        let mut progress = Vec::new();
+        let written = stream_image(
+            &mut reader,
+            &mut output,
+            source.len() as u64,
+            || false,
+            |bytes| progress.push(bytes),
+        )
+        .expect("valid image stream should complete");
+        assert_eq!(written, source.len() as u64);
+        assert_eq!(output, source);
+        assert!(!progress.is_empty());
+        assert!(progress.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(*progress.last().unwrap(), written);
+    }
+
+    #[test]
+    fn image_stream_rejects_truncated_or_growing_sources() {
+        let mut short_reader = std::io::Cursor::new(vec![1_u8; 7]);
+        let mut output = Vec::new();
+        assert!(
+            stream_image(&mut short_reader, &mut output, 8, || false, |_| {})
+                .unwrap_err()
+                .contains("ended early")
+        );
+        let mut long_reader = std::io::Cursor::new(vec![1_u8; 9]);
+        let mut output = Vec::new();
+        assert!(
+            stream_image(&mut long_reader, &mut output, 8, || false, |_| {})
+                .unwrap_err()
+                .contains("grew")
+        );
+    }
+
+    #[test]
+    fn image_stream_cancellation_stops_before_the_next_chunk() {
+        let source = vec![0xA5_u8; 2 * 1024 * 1024];
+        let mut reader = std::io::Cursor::new(source);
+        let mut output = Vec::new();
+        let mut checks = 0;
+        let result = stream_image(
+            &mut reader,
+            &mut output,
+            2 * 1024 * 1024,
+            || {
+                checks += 1;
+                checks > 1
+            },
+            |_| {},
+        );
+        assert!(result.unwrap_err().contains("cancelled"));
+        assert_eq!(output.len(), 1024 * 1024);
     }
 
     #[test]
