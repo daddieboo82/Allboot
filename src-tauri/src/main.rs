@@ -406,8 +406,13 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
     if !image_path.is_file() {
         return Err("The selected image file could not be found.".into());
     }
-    let metadata =
-        std::fs::metadata(image_path).map_err(|e| format!("Could not read image metadata: {e}"))?;
+    let mut file = File::open(image_path).map_err(|e| format!("Could not open image: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("Could not read opened image metadata: {e}"))?;
+    if !metadata.is_file() {
+        return Err("The selected source is not a regular image file.".into());
+    }
     let extension = image_path
         .extension()
         .and_then(|v| v.to_str())
@@ -418,7 +423,6 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         .and_then(|v| v.to_str())
         .unwrap_or("Selected image")
         .to_string();
-    let mut file = File::open(image_path).map_err(|e| format!("Could not open image: {e}"))?;
 
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
@@ -431,9 +435,14 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         }
         hasher.update(&buffer[..count]);
     }
-    let after_hash_metadata = std::fs::metadata(image_path)
-        .map_err(|e| format!("Could not re-check image after hashing: {e}"))?;
-    if !file_metadata_unchanged(&metadata, &after_hash_metadata) {
+    let after_handle_metadata = file
+        .metadata()
+        .map_err(|e| format!("Could not re-check opened image after hashing: {e}"))?;
+    let after_path_metadata = std::fs::metadata(image_path)
+        .map_err(|e| format!("Could not re-check image path after hashing: {e}"))?;
+    if !file_metadata_unchanged(&metadata, &after_handle_metadata)
+        || !file_metadata_unchanged(&metadata, &after_path_metadata)
+    {
         return Err("The image changed while AllBoot was inspecting it. Re-select the file and inspect it again. Nothing was written.".into());
     }
     let sha256 = format!("{:x}", hasher.finalize());
