@@ -89,8 +89,6 @@ fn drive_helper_path() -> Result<std::path::PathBuf, String> {
     Err("AllBoot Drive Helper currently supports Windows and macOS.".into())
 }
 
-const HELPER_VERSION_MARKER: &str = "ALLBOOT_DRIVE_HELPER_VERSION=1";
-
 fn verified_drive_helper_path() -> Result<std::path::PathBuf, String> {
     let path = drive_helper_path()?;
     let contents = std::fs::read_to_string(&path).map_err(|_| {
@@ -122,44 +120,18 @@ fn windows_disk_is_eligible(
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
-fn helper_version_supported(contents: &str) -> bool {
-    let mut lines = contents.lines();
-    let Some(first_line) = lines.next() else {
-        return false;
-    };
-    let marker_matches = |line: &str| line.trim_start_matches('#').trim() == HELPER_VERSION_MARKER;
-    marker_matches(first_line) && !lines.any(marker_matches)
-}
-#[tauri::command]
-fn drive_helper_installed() -> bool {
-    drive_helper_path()
-        .and_then(|path| std::fs::read_to_string(path).map_err(|e| e.to_string()))
-        .map(|contents| helper_version_supported(&contents))
-        .unwrap_or(false)
-}
-
-#[tauri::command]
-fn install_drive_helper() -> Result<String, String> {
-    let path = drive_helper_path()?;
-    let folder = path
-        .parent()
-        .ok_or_else(|| "Could not determine helper installation folder.".to_string())?;
-    std::fs::create_dir_all(folder)
-        .map_err(|e| format!("Could not create the AllBoot helper folder: {e}"))?;
-
-    #[cfg(target_os = "windows")]
-    {
-        let script = r#"# ALLBOOT_DRIVE_HELPER_VERSION=1
+#[cfg(target_os = "windows")]
+fn drive_helper_source() -> &'static str {
+    r#"# ALLBOOT_DRIVE_HELPER_VERSION=1
 $ErrorActionPreference = 'Stop'
 $disks = @(Get-Disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem)
 ConvertTo-Json -InputObject $disks -Compress
-"#;
-        std::fs::write(&path, script)
-            .map_err(|e| format!("Could not install the Windows drive helper: {e}"))?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let script = r#"#!/bin/sh
+"#
+}
+
+#[cfg(target_os = "macos")]
+fn drive_helper_source() -> &'static str {
+    r#"#!/bin/sh
 # ALLBOOT_DRIVE_HELPER_VERSION=1
 set -eu
 action="$1"
@@ -187,7 +159,43 @@ case "$action" in
     exit 2
     ;;
 esac
-"#;
+"#
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn drive_helper_source() -> &'static str {
+    ""
+}
+
+fn helper_version_supported(contents: &str) -> bool {
+    contents == drive_helper_source()
+}
+#[tauri::command]
+fn drive_helper_installed() -> bool {
+    drive_helper_path()
+        .and_then(|path| std::fs::read_to_string(path).map_err(|e| e.to_string()))
+        .map(|contents| helper_version_supported(&contents))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn install_drive_helper() -> Result<String, String> {
+    let path = drive_helper_path()?;
+    let folder = path
+        .parent()
+        .ok_or_else(|| "Could not determine helper installation folder.".to_string())?;
+    std::fs::create_dir_all(folder)
+        .map_err(|e| format!("Could not create the AllBoot helper folder: {e}"))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = drive_helper_source();
+        std::fs::write(&path, script)
+            .map_err(|e| format!("Could not install the Windows drive helper: {e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = drive_helper_source();
         std::fs::write(&path, script)
             .map_err(|e| format!("Could not install the macOS drive helper: {e}"))?;
         use std::os::unix::fs::PermissionsExt;
@@ -788,25 +796,16 @@ mod tests {
     };
 
     #[test]
-    fn drive_helper_installation_requires_a_unique_first_line_version_marker() {
-        assert!(helper_version_supported(
-            "# ALLBOOT_DRIVE_HELPER_VERSION=1\nGet-Disk"
-        ));
-        assert!(helper_version_supported(
-            "ALLBOOT_DRIVE_HELPER_VERSION=1\nset -eu"
-        ));
+    fn drive_helper_installation_requires_exact_shipped_source() {
+        let shipped = drive_helper_source();
+        assert!(helper_version_supported(shipped));
         assert!(!helper_version_supported("Get-Disk"));
+        assert!(!helper_version_supported(&format!(
+            "{}\\n# altered helper payload",
+            shipped
+        )));
         assert!(!helper_version_supported(
             "# ALLBOOT_DRIVE_HELPER_VERSION=2"
-        ));
-        assert!(!helper_version_supported(
-            "# not ALLBOOT_DRIVE_HELPER_VERSION=1"
-        ));
-        assert!(!helper_version_supported(
-            "# ALLBOOT_DRIVE_HELPER_VERSION=1\n# ALLBOOT_DRIVE_HELPER_VERSION=1"
-        ));
-        assert!(!helper_version_supported(
-            "echo unsafe\n# ALLBOOT_DRIVE_HELPER_VERSION=1"
         ));
     }
     #[test]
