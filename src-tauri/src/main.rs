@@ -137,7 +137,16 @@ fn valid_el_torito_catalog(boot_record: &[u8], catalog: &[u8]) -> bool {
         .chunks_exact(2)
         .map(|word| u16::from_le_bytes([word[0], word[1]]))
         .fold(0_u16, u16::wrapping_add);
-    checksum == 0 && catalog[32] == 0x88
+    let initial_entry = &catalog[32..64];
+    let media_type = initial_entry[1];
+    let sector_count = u16::from_le_bytes([initial_entry[6], initial_entry[7]]);
+    let load_rba = u32::from_le_bytes([
+        initial_entry[8],
+        initial_entry[9],
+        initial_entry[10],
+        initial_entry[11],
+    ]);
+    checksum == 0 && initial_entry[0] == 0x88 && media_type <= 4 && sector_count > 0 && load_rba > 0
 }
 
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
@@ -927,6 +936,9 @@ mod tests {
         catalog[30] = 0x55;
         catalog[31] = 0xaa;
         catalog[32] = 0x88;
+        catalog[33] = 0;
+        catalog[38..40].copy_from_slice(&4_u16.to_le_bytes());
+        catalog[40..44].copy_from_slice(&21_u32.to_le_bytes());
         let sum = catalog[..32]
             .chunks_exact(2)
             .map(|word| u16::from_le_bytes([word[0], word[1]]))
@@ -939,6 +951,15 @@ mod tests {
         catalog[32] = 0;
         assert!(!valid_el_torito_catalog(&boot_record, &catalog));
         catalog[32] = 0x88;
+        catalog[33] = 5;
+        assert!(!valid_el_torito_catalog(&boot_record, &catalog));
+        catalog[33] = 0;
+        catalog[38..40].fill(0);
+        assert!(!valid_el_torito_catalog(&boot_record, &catalog));
+        catalog[38..40].copy_from_slice(&4_u16.to_le_bytes());
+        catalog[40..44].fill(0);
+        assert!(!valid_el_torito_catalog(&boot_record, &catalog));
+        catalog[40..44].copy_from_slice(&21_u32.to_le_bytes());
         catalog[28] ^= 1;
         assert!(!valid_el_torito_catalog(&boot_record, &catalog));
         assert!(!valid_el_torito_catalog(&boot_record[..30], &catalog));
@@ -1151,6 +1172,9 @@ mod tests {
         catalog[30] = 0x55;
         catalog[31] = 0xaa;
         catalog[32] = 0x88;
+        catalog[33] = 0;
+        catalog[38..40].copy_from_slice(&4_u16.to_le_bytes());
+        catalog[40..44].copy_from_slice(&21_u32.to_le_bytes());
         let sum = catalog[..32]
             .chunks_exact(2)
             .map(|word| u16::from_le_bytes([word[0], word[1]]))
