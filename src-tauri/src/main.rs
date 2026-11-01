@@ -467,6 +467,7 @@ fn preflight_write(
     disk_number: u32,
     expected_unique_id: String,
     image_path: String,
+    expected_sha256: String,
 ) -> Result<PreflightReport, String> {
     #[cfg(target_os = "windows")]
     {
@@ -509,6 +510,9 @@ fn preflight_write(
         }
         let disk_size = disk.size.unwrap_or(0);
         let image = inspect_image(image_path)?;
+        if !image.sha256.eq_ignore_ascii_case(expected_sha256.trim()) {
+            return Err("The selected image changed after inspection. Re-select the image and run preflight again. Nothing was written.".into());
+        }
         if image.size_bytes > disk_size {
             return Err(format!("The image is larger than the selected USB drive ({} bytes available, {} bytes required). Nothing was written.", disk_size, image.size_bytes));
         }
@@ -601,6 +605,9 @@ fn preflight_write(
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         let image = inspect_image(image_path)?;
+        if !image.sha256.eq_ignore_ascii_case(expected_sha256.trim()) {
+            return Err("The selected image changed after inspection. Re-select the image and run preflight again. Nothing was written.".into());
+        }
         if image.size_bytes > disk_size {
             return Err(format!("The image is larger than the selected external disk ({} bytes available, {} bytes required). Nothing was written.", disk_size, image.size_bytes));
         }
@@ -628,7 +635,7 @@ fn preflight_write(
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let _ = (disk_number, expected_unique_id, image_path);
+        let _ = (disk_number, expected_unique_id, image_path, expected_sha256);
         Err("AllBoot preflight supports Windows and macOS.".into())
     }
 }
@@ -757,6 +764,9 @@ mod tests {
                 drive.disk_number,
                 drive.unique_id.clone(),
                 path.to_string_lossy().to_string(),
+                inspect_image(path.to_string_lossy().to_string())
+                    .unwrap()
+                    .sha256,
             )
             .expect("matching USB identity should pass read-only preflight");
             assert_eq!(report.disk_number, drive.disk_number);
@@ -768,6 +778,9 @@ mod tests {
                 drive.disk_number,
                 "not-the-real-device-id".into(),
                 path.to_string_lossy().to_string(),
+                inspect_image(path.to_string_lossy().to_string())
+                    .unwrap()
+                    .sha256,
             );
             assert!(mismatch.is_err(), "changed device identity must be blocked");
             fs::remove_file(path).unwrap();
