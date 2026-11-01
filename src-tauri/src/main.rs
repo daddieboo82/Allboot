@@ -219,6 +219,16 @@ fn is_usb_bus_protocol(protocol: &str) -> bool {
     protocol.trim().eq_ignore_ascii_case("USB")
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_disk_is_eligible(
+    internal: bool,
+    whole: bool,
+    is_boot: bool,
+    bus_protocol: &str,
+    has_stable_identity: bool,
+) -> bool {
+    !internal && whole && !is_boot && is_usb_bus_protocol(bus_protocol) && has_stable_identity
+}
 fn stable_macos_disk_identity(detail: &serde_json::Value) -> Option<String> {
     let serial = detail
         .get("SerialNumber")
@@ -368,9 +378,7 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                 Some(value) => value,
                 None => continue,
             };
-            if !is_usb_bus_protocol(bus) {
-                return Err("Safety check blocked this device because macOS does not identify it as USB storage. Nothing was written.".into());
-            }
+
             let serial = detail
                 .get("SerialNumber")
                 .and_then(|v| v.as_str())
@@ -754,6 +762,21 @@ mod tests {
         let after = std::fs::metadata(&path).unwrap();
         assert!(!file_metadata_unchanged(&before, &after));
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn macos_disk_eligibility_requires_every_safety_condition() {
+        assert!(macos_disk_is_eligible(false, true, false, "USB", true));
+        assert!(!macos_disk_is_eligible(true, true, false, "USB", true));
+        assert!(!macos_disk_is_eligible(false, false, false, "USB", true));
+        assert!(!macos_disk_is_eligible(false, true, true, "USB", true));
+        assert!(!macos_disk_is_eligible(
+            false,
+            true,
+            false,
+            "Thunderbolt",
+            true
+        ));
+        assert!(!macos_disk_is_eligible(false, true, false, "USB", false));
     }
     #[test]
     fn macos_drive_filter_accepts_only_usb_bus_protocol() {
