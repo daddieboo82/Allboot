@@ -72,3 +72,8 @@ The same AllBoot first-run setup flow installs a tiny helper tailored to the hos
 The helper is installed per user, requires no administrator privileges for read-only discovery, and does not write, erase, partition or format disks. The app independently rechecks the selected device identity and excludes internal/startup disks before any future write operation.
 
 Tauri packaging uses the host platform's default bundle targets so Windows builds produce Windows installers and macOS builds produce macOS app/DMG packages. A macOS build must be produced and tested on macOS; this Windows development machine cannot validate the macOS helper against real Apple hardware. The macOS implementation is present in the shared Rust code but requires a native macOS build and device test before being called release-ready.
+
+
+## Latest safety validation
+
+The macOS startup-volume parser accepts whole-disk and valid APFS/HFS partition identifiers (for example, disk3, disk3s1 and disk3s1s2) and rejects malformed identifiers. The Windows workstation test suite currently passes 4 tests, including a read-only preflight against an attached USB device and an identity-mismatch rejection. This does not replace a native macOS build or physical Mac testing.

@@ -1,49 +1,87 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs::File, io::{Read, Seek, SeekFrom}, path::Path, process::Command};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    process::Command,
+};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DestinationDrive {
-    disk_number: u32, name: String, bus_type: String, size_bytes: u64,
-    serial_number: String, unique_id: String, partition_style: String,
-    is_boot: bool, is_system: bool,
+    disk_number: u32,
+    name: String,
+    bus_type: String,
+    size_bytes: u64,
+    serial_number: String,
+    unique_id: String,
+    partition_style: String,
+    is_boot: bool,
+    is_system: bool,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct PowerShellDisk {
-    number: u32, friendly_name: Option<String>, bus_type: Option<String>,
-    size: Option<u64>, serial_number: Option<String>, unique_id: Option<String>,
-    partition_style: Option<String>, is_boot: Option<bool>, is_system: Option<bool>,
+    number: u32,
+    friendly_name: Option<String>,
+    bus_type: Option<String>,
+    size: Option<u64>,
+    serial_number: Option<String>,
+    unique_id: Option<String>,
+    partition_style: Option<String>,
+    is_boot: Option<bool>,
+    is_system: Option<bool>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImageInspection {
-    name: String, path: String, size_bytes: u64, extension: String,
-    detected_format: String, iso9660_signature: bool, el_torito_boot_record: bool,
-    udif_signature: bool, macos_candidate: bool, sha256: String, bootability: String,
+    name: String,
+    path: String,
+    size_bytes: u64,
+    extension: String,
+    detected_format: String,
+    iso9660_signature: bool,
+    el_torito_boot_record: bool,
+    udif_signature: bool,
+    macos_candidate: bool,
+    sha256: String,
+    bootability: String,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PreflightReport {
-    disk_number: u32, drive_name: String, disk_size_bytes: u64,
-    image_name: String, image_size_bytes: u64, image_sha256: String,
-    confirmation_phrase: String, checks: Vec<String>,
+    disk_number: u32,
+    drive_name: String,
+    disk_size_bytes: u64,
+    image_name: String,
+    image_size_bytes: u64,
+    image_sha256: String,
+    confirmation_phrase: String,
+    checks: Vec<String>,
 }
 
 #[cfg(target_os = "windows")]
 fn drive_helper_path() -> Result<std::path::PathBuf, String> {
     let local = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| "Windows local application-data folder is unavailable.".to_string())?;
-    Ok(std::path::PathBuf::from(local).join("AllBoot").join("DriveHelper").join("AllBootDriveHelper.ps1"))
+    Ok(std::path::PathBuf::from(local)
+        .join("AllBoot")
+        .join("DriveHelper")
+        .join("AllBootDriveHelper.ps1"))
 }
 
 #[cfg(target_os = "macos")]
 fn drive_helper_path() -> Result<std::path::PathBuf, String> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| "macOS home folder is unavailable.".to_string())?;
-    Ok(std::path::PathBuf::from(home).join("Library").join("Application Support").join("AllBoot").join("DriveHelper").join("AllBootDriveHelper.sh"))
+    let home =
+        std::env::var_os("HOME").ok_or_else(|| "macOS home folder is unavailable.".to_string())?;
+    Ok(std::path::PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("AllBoot")
+        .join("DriveHelper")
+        .join("AllBootDriveHelper.sh"))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -53,19 +91,25 @@ fn drive_helper_path() -> Result<std::path::PathBuf, String> {
 
 #[tauri::command]
 fn drive_helper_installed() -> bool {
-    drive_helper_path().map(|path| path.is_file()).unwrap_or(false)
+    drive_helper_path()
+        .map(|path| path.is_file())
+        .unwrap_or(false)
 }
 
 #[tauri::command]
 fn install_drive_helper() -> Result<String, String> {
     let path = drive_helper_path()?;
-    let folder = path.parent().ok_or_else(|| "Could not determine helper installation folder.".to_string())?;
-    std::fs::create_dir_all(folder).map_err(|e| format!("Could not create the AllBoot helper folder: {e}"))?;
+    let folder = path
+        .parent()
+        .ok_or_else(|| "Could not determine helper installation folder.".to_string())?;
+    std::fs::create_dir_all(folder)
+        .map_err(|e| format!("Could not create the AllBoot helper folder: {e}"))?;
 
     #[cfg(target_os = "windows")]
     {
         let script = "$ErrorActionPreference = 'Stop'; $disks = @(Get-Disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem); ConvertTo-Json -InputObject $disks -Compress";
-        std::fs::write(&path, script).map_err(|e| format!("Could not install the Windows drive helper: {e}"))?;
+        std::fs::write(&path, script)
+            .map_err(|e| format!("Could not install the Windows drive helper: {e}"))?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -90,21 +134,35 @@ case "$action" in
     ;;
 esac
 "#;
-        std::fs::write(&path, script).map_err(|e| format!("Could not install the macOS drive helper: {e}"))?;
+        std::fs::write(&path, script)
+            .map_err(|e| format!("Could not install the macOS drive helper: {e}"))?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("Could not make the macOS helper executable: {e}"))?;
     }
-    if !path.is_file() { return Err("The helper could not be verified after installation.".into()); }
+    if !path.is_file() {
+        return Err("The helper could not be verified after installation.".into());
+    }
     Ok(path.to_string_lossy().to_string())
 }
 #[cfg(any(target_os = "macos", test))]
 fn parent_disk_identifier(volume_id: &str) -> Option<String> {
     let rest = volume_id.strip_prefix("disk")?;
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() { return None; }
+    if digits.is_empty() {
+        return None;
+    }
     let suffix = &rest[digits.len()..];
-    if !suffix.is_empty() && !suffix.starts_with('s') { return None; }
+    if !suffix.is_empty() {
+        let partitions = suffix.strip_prefix('s')?;
+        if partitions.is_empty()
+            || !partitions
+                .split('s')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        {
+            return None;
+        }
+    }
     Some(format!("disk{}", digits))
 }
 #[tauri::command]
@@ -113,10 +171,22 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
     {
         let script = "$ErrorActionPreference='Stop'; $helper=$env:ALLBOOT_HELPER_PATH; if (-not (Test-Path -LiteralPath $helper)) { throw 'AllBoot Drive Helper is not installed. Install it from the AllBoot setup prompt.' }; & $helper";
         let output = Command::new("powershell.exe")
-            .env("ALLBOOT_HELPER_PATH", drive_helper_path()?.to_string_lossy().to_string())
-            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
-            .output().map_err(|e| format!("Could not enumerate disks: {e}"))?;
-        if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()); }
+            .env(
+                "ALLBOOT_HELPER_PATH",
+                drive_helper_path()?.to_string_lossy().to_string(),
+            )
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .output()
+            .map_err(|e| format!("Could not enumerate disks: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
         let disks: Vec<PowerShellDisk> = serde_json::from_slice(&output.stdout)
             .map_err(|e| format!("Could not read Windows disk inventory: {e}"))?;
         let mut result = Vec::new();
@@ -124,15 +194,21 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
             let bus_type = disk.bus_type.unwrap_or_default();
             let is_boot = disk.is_boot.unwrap_or(false);
             let is_system = disk.is_system.unwrap_or(false);
-            if !bus_type.eq_ignore_ascii_case("USB") || is_boot || is_system { continue; }
+            if !bus_type.eq_ignore_ascii_case("USB") || is_boot || is_system {
+                continue;
+            }
             result.push(DestinationDrive {
                 disk_number: disk.number,
-                name: disk.friendly_name.unwrap_or_else(|| "USB storage device".into()),
-                bus_type, size_bytes: disk.size.unwrap_or(0),
+                name: disk
+                    .friendly_name
+                    .unwrap_or_else(|| "USB storage device".into()),
+                bus_type,
+                size_bytes: disk.size.unwrap_or(0),
                 serial_number: disk.serial_number.unwrap_or_default(),
                 unique_id: disk.unique_id.unwrap_or_default(),
                 partition_style: disk.partition_style.unwrap_or_default(),
-                is_boot, is_system,
+                is_boot,
+                is_system,
             });
         }
         Ok(result)
@@ -141,10 +217,16 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
     {
         let helper = drive_helper_path()?;
         let run = |args: &[&str]| -> Result<serde_json::Value, String> {
-            let output = Command::new("sh").arg(&helper).args(args).output()
+            let output = Command::new("sh")
+                .arg(&helper)
+                .args(args)
+                .output()
                 .map_err(|e| format!("Could not run AllBoot Drive Helper: {e}"))?;
-            if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()); }
-            serde_json::from_slice(&output.stdout).map_err(|e| format!("Could not parse macOS disk information: {e}"))
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            serde_json::from_slice(&output.stdout)
+                .map_err(|e| format!("Could not parse macOS disk information: {e}"))
         };
         let inventory = run(&["list"])?;
         let boot_info = run(&["boot"])?;
@@ -153,74 +235,158 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
             .ok_or_else(|| "Could not identify the current macOS startup volume; discovery is blocked for safety.".to_string())?;
         let boot_disk = parent_disk_identifier(boot_volume)
             .ok_or_else(|| "Could not identify the parent of the macOS startup volume; discovery is blocked for safety.".to_string())?;
-        let disks = inventory.get("AllDisksAndPartitions").and_then(|v| v.as_array())
+        let disks = inventory
+            .get("AllDisksAndPartitions")
+            .and_then(|v| v.as_array())
             .ok_or_else(|| "macOS returned no external physical disk list.".to_string())?;
         let mut result = Vec::new();
         for entry in disks {
-            let identifier = match entry.get("DeviceIdentifier").and_then(|v| v.as_str()) { Some(v) => v, None => continue };
-            if !identifier.starts_with("disk") || !identifier[4..].chars().all(|c| c.is_ascii_digit()) { continue; }
-            let detail = match run(&["info", identifier]) { Ok(v) => v, Err(_) => continue };
-            let internal = detail.get("Internal").and_then(|v| v.as_bool()).unwrap_or(true);
-            let whole = detail.get("Whole").and_then(|v| v.as_bool()).unwrap_or(false);
-            let actual_id = detail.get("DeviceIdentifier").and_then(|v| v.as_str()).unwrap_or(identifier);
+            let identifier = match entry.get("DeviceIdentifier").and_then(|v| v.as_str()) {
+                Some(v) => v,
+                None => continue,
+            };
+            if !identifier.starts_with("disk")
+                || !identifier[4..].chars().all(|c| c.is_ascii_digit())
+            {
+                continue;
+            }
+            let detail = match run(&["info", identifier]) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let internal = detail
+                .get("Internal")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let whole = detail
+                .get("Whole")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let actual_id = detail
+                .get("DeviceIdentifier")
+                .and_then(|v| v.as_str())
+                .unwrap_or(identifier);
             let is_boot = actual_id == boot_disk;
-            if internal || !whole || is_boot { continue; }
-            let bus = detail.get("BusProtocol").or_else(|| detail.get("Protocol")).and_then(|v| v.as_str()).unwrap_or("External");
-            let size = detail.get("TotalSize").and_then(|v| v.as_u64()).unwrap_or(0);
+            if internal || !whole || is_boot {
+                continue;
+            }
+            let bus = detail
+                .get("BusProtocol")
+                .or_else(|| detail.get("Protocol"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("External");
+            let size = detail
+                .get("TotalSize")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let number = identifier[4..].parse::<u32>().unwrap_or(0);
-            let name = detail.get("MediaName").and_then(|v| v.as_str()).unwrap_or("External storage device").to_string();
-            let serial = detail.get("SerialNumber").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = detail
+                .get("MediaName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("External storage device")
+                .to_string();
+            let serial = detail
+                .get("SerialNumber")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             result.push(DestinationDrive {
-                disk_number: number, name, bus_type: bus.to_string(), size_bytes: size,
-                serial_number: serial.clone(), unique_id: format!("{}|{}|{}", serial, detail.get("MediaUUID").and_then(|v| v.as_str()).unwrap_or(""), detail.get("DeviceTreePath").and_then(|v| v.as_str()).unwrap_or(actual_id)),
-                partition_style: detail.get("PartitionMapPartition").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
-                is_boot, is_system: is_boot,
+                disk_number: number,
+                name,
+                bus_type: bus.to_string(),
+                size_bytes: size,
+                serial_number: serial.clone(),
+                unique_id: format!(
+                    "{}|{}|{}",
+                    serial,
+                    detail
+                        .get("MediaUUID")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    detail
+                        .get("DeviceTreePath")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(actual_id)
+                ),
+                partition_style: detail
+                    .get("PartitionMapPartition")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string(),
+                is_boot,
+                is_system: is_boot,
             });
         }
         Ok(result)
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    { Err("AllBoot drive discovery supports Windows and macOS.".into()) }
+    {
+        Err("AllBoot drive discovery supports Windows and macOS.".into())
+    }
 }
 
 #[tauri::command]
 fn inspect_image(path: String) -> Result<ImageInspection, String> {
     let image_path = Path::new(&path);
-    if !image_path.is_file() { return Err("The selected image file could not be found.".into()); }
-    let metadata = std::fs::metadata(image_path).map_err(|e| format!("Could not read image metadata: {e}"))?;
-    let extension = image_path.extension().and_then(|v| v.to_str()).unwrap_or("").to_ascii_lowercase();
-    let name = image_path.file_name().and_then(|v| v.to_str()).unwrap_or("Selected image").to_string();
+    if !image_path.is_file() {
+        return Err("The selected image file could not be found.".into());
+    }
+    let metadata =
+        std::fs::metadata(image_path).map_err(|e| format!("Could not read image metadata: {e}"))?;
+    let extension = image_path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let name = image_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("Selected image")
+        .to_string();
     let mut file = File::open(image_path).map_err(|e| format!("Could not open image: {e}"))?;
 
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
-        let count = file.read(&mut buffer).map_err(|e| format!("Could not hash image: {e}"))?;
-        if count == 0 { break; }
+        let count = file
+            .read(&mut buffer)
+            .map_err(|e| format!("Could not hash image: {e}"))?;
+        if count == 0 {
+            break;
+        }
         hasher.update(&buffer[..count]);
     }
     let sha256 = format!("{:x}", hasher.finalize());
 
     let mut pvd = [0_u8; 6];
     let iso9660_signature = if metadata.len() >= 32_774 {
-        file.seek(SeekFrom::Start(32_768)).map_err(|e| format!("Could not inspect ISO header: {e}"))?;
+        file.seek(SeekFrom::Start(32_768))
+            .map_err(|e| format!("Could not inspect ISO header: {e}"))?;
         file.read_exact(&mut pvd).is_ok() && pvd[0] == 1 && &pvd[1..6] == b"CD001"
-    } else { false };
+    } else {
+        false
+    };
 
     let mut boot_record = [0_u8; 39];
     let el_torito_boot_record = if metadata.len() >= 34_855 {
-        file.seek(SeekFrom::Start(34_816)).map_err(|e| format!("Could not inspect ISO boot record: {e}"))?;
+        file.seek(SeekFrom::Start(34_816))
+            .map_err(|e| format!("Could not inspect ISO boot record: {e}"))?;
         file.read_exact(&mut boot_record).is_ok()
             && boot_record[0] == 0
             && &boot_record[1..6] == b"CD001"
             && &boot_record[7..30] == b"EL TORITO SPECIFICATION"
-    } else { false };
+    } else {
+        false
+    };
 
     let mut udif = [0_u8; 4];
     let udif_signature = if metadata.len() >= 512 {
-        file.seek(SeekFrom::Start(metadata.len() - 512)).map_err(|e| format!("Could not inspect DMG trailer: {e}"))?;
+        file.seek(SeekFrom::Start(metadata.len() - 512))
+            .map_err(|e| format!("Could not inspect DMG trailer: {e}"))?;
         file.read_exact(&mut udif).is_ok() && &udif == b"koly"
-    } else { false };
+    } else {
+        false
+    };
 
     let detected_format = if udif_signature {
         "Apple UDIF disk image (DMG)".to_string()
@@ -240,9 +406,11 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
     let bootability = if udif_signature {
         "Apple UDIF container detected. This does not prove it is a full macOS installer or a bootable USB source.".into()
     } else if el_torito_boot_record {
-        "El Torito boot record detected. Confirm operating-system compatibility before writing.".into()
+        "El Torito boot record detected. Confirm operating-system compatibility before writing."
+            .into()
     } else if iso9660_signature {
-        "ISO 9660 structure detected; no El Torito boot record found. Bootability is unconfirmed.".into()
+        "ISO 9660 structure detected; no El Torito boot record found. Bootability is unconfirmed."
+            .into()
     } else if macos_candidate {
         "Candidate only. File extension does not prove that this image is bootable.".into()
     } else {
@@ -250,32 +418,63 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
     };
 
     Ok(ImageInspection {
-        name, path, size_bytes: metadata.len(), extension, detected_format,
-        iso9660_signature, el_torito_boot_record, udif_signature, macos_candidate,
-        sha256, bootability,
+        name,
+        path,
+        size_bytes: metadata.len(),
+        extension,
+        detected_format,
+        iso9660_signature,
+        el_torito_boot_record,
+        udif_signature,
+        macos_candidate,
+        sha256,
+        bootability,
     })
 }
 
 #[tauri::command]
-fn preflight_write(disk_number: u32, expected_unique_id: String, image_path: String) -> Result<PreflightReport, String> {
+fn preflight_write(
+    disk_number: u32,
+    expected_unique_id: String,
+    image_path: String,
+) -> Result<PreflightReport, String> {
     #[cfg(target_os = "windows")]
     {
         let script = "$ErrorActionPreference='Stop'; $n=[uint32]$env:ALLBOOT_DISK_NUMBER; $disk=Get-Disk -Number $n; $disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem | ConvertTo-Json -Compress";
         let output = Command::new("powershell.exe")
             .env("ALLBOOT_DISK_NUMBER", disk_number.to_string())
-            .env("ALLBOOT_HELPER_PATH", drive_helper_path()?.to_string_lossy().to_string())
-            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
-            .output().map_err(|e| format!("Could not re-check the selected disk: {e}"))?;
-        if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()); }
+            .env(
+                "ALLBOOT_HELPER_PATH",
+                drive_helper_path()?.to_string_lossy().to_string(),
+            )
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .output()
+            .map_err(|e| format!("Could not re-check the selected disk: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
         let disk: PowerShellDisk = serde_json::from_slice(&output.stdout)
             .map_err(|e| format!("Could not read selected disk identity: {e}"))?;
         let bus_type = disk.bus_type.unwrap_or_default();
-        if !bus_type.eq_ignore_ascii_case("USB") { return Err("The selected device is no longer identified as USB storage. Nothing was written.".into()); }
+        if !bus_type.eq_ignore_ascii_case("USB") {
+            return Err(
+                "The selected device is no longer identified as USB storage. Nothing was written."
+                    .into(),
+            );
+        }
         if disk.is_boot.unwrap_or(false) || disk.is_system.unwrap_or(false) {
             return Err("Safety check blocked this device because Windows identifies it as a boot or system disk. Nothing was written.".into());
         }
         let actual_id = disk.unique_id.unwrap_or_default();
-        if expected_unique_id.trim().is_empty() || !actual_id.eq_ignore_ascii_case(expected_unique_id.trim()) {
+        if expected_unique_id.trim().is_empty()
+            || !actual_id.eq_ignore_ascii_case(expected_unique_id.trim())
+        {
             return Err("The selected USB device identity changed since selection. Scan again and re-select the intended drive. Nothing was written.".into());
         }
         let disk_size = disk.size.unwrap_or(0);
@@ -284,9 +483,15 @@ fn preflight_write(disk_number: u32, expected_unique_id: String, image_path: Str
             return Err(format!("The image is larger than the selected USB drive ({} bytes available, {} bytes required). Nothing was written.", disk_size, image.size_bytes));
         }
         Ok(PreflightReport {
-            disk_number, drive_name: disk.friendly_name.unwrap_or_else(|| "USB storage device".into()),
-            disk_size_bytes: disk_size, image_name: image.name, image_size_bytes: image.size_bytes,
-            image_sha256: image.sha256, confirmation_phrase: format!("ERASE DISK {}", disk_number),
+            disk_number,
+            drive_name: disk
+                .friendly_name
+                .unwrap_or_else(|| "USB storage device".into()),
+            disk_size_bytes: disk_size,
+            image_name: image.name,
+            image_size_bytes: image.size_bytes,
+            image_sha256: image.sha256,
+            confirmation_phrase: format!("ERASE DISK {}", disk_number),
             checks: vec![
                 "Destination re-queried immediately before preparation".into(),
                 "USB bus type confirmed".into(),
@@ -304,40 +509,92 @@ fn preflight_write(disk_number: u32, expected_unique_id: String, image_path: Str
         let run_info = |action: &str, id: Option<&str>| -> Result<serde_json::Value, String> {
             let mut command = Command::new("sh");
             command.arg(&helper).arg(action);
-            if let Some(value) = id { command.arg(value); }
-            let output = command.output().map_err(|e| format!("Could not re-check macOS disk: {e}"))?;
-            if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()); }
-            serde_json::from_slice(&output.stdout).map_err(|e| format!("Could not parse macOS disk identity: {e}"))
+            if let Some(value) = id {
+                command.arg(value);
+            }
+            let output = command
+                .output()
+                .map_err(|e| format!("Could not re-check macOS disk: {e}"))?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            serde_json::from_slice(&output.stdout)
+                .map_err(|e| format!("Could not parse macOS disk identity: {e}"))
         };
         let detail = run_info("info", Some(&disk_id))?;
         let boot = run_info("boot", None)?;
-        let boot_volume = boot.get("DeviceIdentifier").and_then(|v| v.as_str())
+        let boot_volume = boot
+            .get("DeviceIdentifier")
+            .and_then(|v| v.as_str())
             .or_else(|| boot.get("PartOfWhole").and_then(|v| v.as_str()))
-            .ok_or_else(|| "Could not identify the current macOS startup volume. Nothing was written.".to_string())?;
-        let boot_disk = parent_disk_identifier(boot_volume)
-            .ok_or_else(|| "Could not identify the parent of the macOS startup volume. Nothing was written.".to_string())?;
-        let actual_id = detail.get("DeviceIdentifier").and_then(|v| v.as_str()).unwrap_or("");
-        let internal = detail.get("Internal").and_then(|v| v.as_bool()).unwrap_or(true);
-        let whole = detail.get("Whole").and_then(|v| v.as_bool()).unwrap_or(false);
+            .ok_or_else(|| {
+                "Could not identify the current macOS startup volume. Nothing was written."
+                    .to_string()
+            })?;
+        let boot_disk = parent_disk_identifier(boot_volume).ok_or_else(|| {
+            "Could not identify the parent of the macOS startup volume. Nothing was written."
+                .to_string()
+        })?;
+        let actual_id = detail
+            .get("DeviceIdentifier")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let internal = detail
+            .get("Internal")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let whole = detail
+            .get("Whole")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let is_boot = actual_id == boot_disk;
         if internal || !whole || actual_id != disk_id || is_boot {
             return Err("Safety check blocked this disk because it is internal, a startup disk, or no longer the selected whole external disk. Nothing was written.".into());
         }
-        let bus = detail.get("BusProtocol").or_else(|| detail.get("Protocol")).and_then(|v| v.as_str()).unwrap_or("External");
-        let serial = detail.get("SerialNumber").and_then(|v| v.as_str()).unwrap_or("");
-        let stable_id = format!("{}|{}|{}", serial, detail.get("MediaUUID").and_then(|v| v.as_str()).unwrap_or(""), detail.get("DeviceTreePath").and_then(|v| v.as_str()).unwrap_or(actual_id));
+        let bus = detail
+            .get("BusProtocol")
+            .or_else(|| detail.get("Protocol"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("External");
+        let serial = detail
+            .get("SerialNumber")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let stable_id = format!(
+            "{}|{}|{}",
+            serial,
+            detail
+                .get("MediaUUID")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            detail
+                .get("DeviceTreePath")
+                .and_then(|v| v.as_str())
+                .unwrap_or(actual_id)
+        );
         if expected_unique_id.trim().is_empty() || stable_id != expected_unique_id {
             return Err("The selected external disk identity changed. Scan again and re-select it. Nothing was written.".into());
         }
-        let disk_size = detail.get("TotalSize").and_then(|v| v.as_u64()).unwrap_or(0);
+        let disk_size = detail
+            .get("TotalSize")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let image = inspect_image(image_path)?;
         if image.size_bytes > disk_size {
             return Err(format!("The image is larger than the selected external disk ({} bytes available, {} bytes required). Nothing was written.", disk_size, image.size_bytes));
         }
         Ok(PreflightReport {
-            disk_number, drive_name: detail.get("MediaName").and_then(|v| v.as_str()).unwrap_or("External storage device").to_string(),
-            disk_size_bytes: disk_size, image_name: image.name, image_size_bytes: image.size_bytes,
-            image_sha256: image.sha256, confirmation_phrase: format!("ERASE DISK {}", disk_number),
+            disk_number,
+            drive_name: detail
+                .get("MediaName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("External storage device")
+                .to_string(),
+            disk_size_bytes: disk_size,
+            image_name: image.name,
+            image_size_bytes: image.size_bytes,
+            image_sha256: image.sha256,
+            confirmation_phrase: format!("ERASE DISK {}", disk_number),
             checks: vec![
                 "External physical disk re-queried immediately before preparation".into(),
                 format!("External connection protocol confirmed: {}", bus),
@@ -358,7 +615,10 @@ fn preflight_write(disk_number: u32, expected_unique_id: String, image_path: Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn parses_macos_startup_volume_parent_disk() {
@@ -367,10 +627,21 @@ mod tests {
         assert_eq!(parent_disk_identifier("disk0"), Some("disk0".into()));
         assert_eq!(parent_disk_identifier("not-a-disk"), None);
         assert_eq!(parent_disk_identifier("diskx1"), None);
+        assert_eq!(parent_disk_identifier("disk3s"), None);
+        assert_eq!(parent_disk_identifier("disk3s1s2"), Some("disk3".into()));
+        assert_eq!(parent_disk_identifier("disk3sabc"), None);
+        assert_eq!(parent_disk_identifier("disk3abc"), None);
     }
 
-    #[test]    fn detects_iso9660_and_el_torito_and_hashes_source() {
-        let path = std::env::temp_dir().join(format!("allboot-test-{}.iso", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    #[test]
+    fn detects_iso9660_and_el_torito_and_hashes_source() {
+        let path = std::env::temp_dir().join(format!(
+            "allboot-test-{}.iso",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let mut bytes = vec![0_u8; 34_855];
         bytes[32_768] = 1;
         bytes[32_769..32_774].copy_from_slice(b"CD001");
@@ -388,7 +659,13 @@ mod tests {
 
     #[test]
     fn does_not_mistake_a_dmg_extension_for_a_udif_container() {
-        let path = std::env::temp_dir().join(format!("allboot-test-{}.dmg", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!(
+            "allboot-test-{}.dmg",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::write(&path, vec![0_u8; 1024]).unwrap();
         let result = inspect_image(path.to_string_lossy().to_string()).unwrap();
         assert!(!result.udif_signature);
@@ -398,7 +675,8 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn safe_preflight_rechecks_real_usb_identity_without_writing() {
-        let installed_path = install_drive_helper().expect("helper should install for the integration test");
+        let installed_path =
+            install_drive_helper().expect("helper should install for the integration test");
         assert!(std::path::Path::new(&installed_path).is_file());
         assert!(drive_helper_installed());
         let drives = list_destination_drives().expect("USB inventory should be readable");
@@ -409,16 +687,23 @@ mod tests {
         if let Some(drive) = drives.first() {
             let path = std::env::temp_dir().join(format!(
                 "allboot-preflight-test-{}.img",
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
             ));
             fs::write(&path, vec![0x5A_u8; 1024]).unwrap();
             let report = preflight_write(
                 drive.disk_number,
                 drive.unique_id.clone(),
                 path.to_string_lossy().to_string(),
-            ).expect("matching USB identity should pass read-only preflight");
+            )
+            .expect("matching USB identity should pass read-only preflight");
             assert_eq!(report.disk_number, drive.disk_number);
-            assert_eq!(report.confirmation_phrase, format!("ERASE DISK {}", drive.disk_number));
+            assert_eq!(
+                report.confirmation_phrase,
+                format!("ERASE DISK {}", drive.disk_number)
+            );
             let mismatch = preflight_write(
                 drive.disk_number,
                 "not-the-real-device-id".into(),
@@ -436,13 +721,25 @@ mod tests {
         let helper = std::path::Path::new(&installed_path);
         assert!(helper.is_file());
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(helper).unwrap().permissions().mode() & 0o777, 0o700);
-        let output = Command::new("sh").arg(helper).arg("list").output().expect("helper should execute");
+        assert_eq!(
+            std::fs::metadata(helper).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let output = Command::new("sh")
+            .arg(helper)
+            .arg("list")
+            .output()
+            .expect("helper should execute");
         assert!(output.status.success(), "helper list action should succeed");
-        let _: serde_json::Value = serde_json::from_slice(&output.stdout).expect("diskutil plist JSON should parse");
-        let drives = list_destination_drives().expect("macOS external disk discovery should succeed");
+        let _: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("diskutil plist JSON should parse");
+        let drives =
+            list_destination_drives().expect("macOS external disk discovery should succeed");
         for drive in drives {
-            assert!(!drive.is_boot && !drive.is_system, "startup disk must not be selectable");
+            assert!(
+                !drive.is_boot && !drive.is_system,
+                "startup disk must not be selectable"
+            );
         }
     }
 }
@@ -450,7 +747,13 @@ mod tests {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![list_destination_drives, drive_helper_installed, install_drive_helper, inspect_image, preflight_write])
+        .invoke_handler(tauri::generate_handler![
+            list_destination_drives,
+            drive_helper_installed,
+            install_drive_helper,
+            inspect_image,
+            preflight_write
+        ])
         .run(tauri::generate_context!())
         .expect("error while running AllBoot ISO Maker");
 }
