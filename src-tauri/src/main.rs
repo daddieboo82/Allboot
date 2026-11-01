@@ -123,9 +123,12 @@ fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
 fn helper_version_supported(contents: &str) -> bool {
-    contents
-        .lines()
-        .any(|line| line.trim_start_matches('#').trim() == HELPER_VERSION_MARKER)
+    let mut lines = contents.lines();
+    let Some(first_line) = lines.next() else {
+        return false;
+    };
+    let marker_matches = |line: &str| line.trim_start_matches('#').trim() == HELPER_VERSION_MARKER;
+    marker_matches(first_line) && !lines.any(marker_matches)
 }
 #[tauri::command]
 fn drive_helper_installed() -> bool {
@@ -785,7 +788,7 @@ mod tests {
     };
 
     #[test]
-    fn drive_helper_installation_requires_the_expected_version_marker() {
+    fn drive_helper_installation_requires_a_unique_first_line_version_marker() {
         assert!(helper_version_supported(
             "# ALLBOOT_DRIVE_HELPER_VERSION=1\nGet-Disk"
         ));
@@ -798,6 +801,12 @@ mod tests {
         ));
         assert!(!helper_version_supported(
             "# not ALLBOOT_DRIVE_HELPER_VERSION=1"
+        ));
+        assert!(!helper_version_supported(
+            "# ALLBOOT_DRIVE_HELPER_VERSION=1\n# ALLBOOT_DRIVE_HELPER_VERSION=1"
+        ));
+        assert!(!helper_version_supported(
+            "echo unsafe\n# ALLBOOT_DRIVE_HELPER_VERSION=1"
         ));
     }
     #[test]
