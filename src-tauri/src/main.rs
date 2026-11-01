@@ -265,6 +265,30 @@ fn erase_confirmation_phrase(
         .collect::<String>();
     format!("ERASE DISK {disk_number} {challenge}")
 }
+fn validate_erase_confirmation(
+    disk_number: u32,
+    stable_identity: &str,
+    image_sha256: &str,
+    supplied_phrase: &str,
+) -> Result<(), String> {
+    if stable_identity.trim().is_empty()
+        || image_sha256.trim().len() != 64
+        || !image_sha256
+            .trim()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(
+            "The selected device identity or image hash is invalid. Run preflight again.".into(),
+        );
+    }
+    let expected = erase_confirmation_phrase(disk_number, stable_identity, image_sha256);
+    if supplied_phrase != expected {
+        return Err("Erase confirmation does not match this exact USB device and image. Nothing was written.".into());
+    }
+    Ok(())
+}
+
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
@@ -1402,6 +1426,20 @@ mod tests {
                 "startup disk must not be selectable"
             );
         }
+    }
+
+    #[test]
+    fn erase_confirmation_validator_requires_exact_current_challenge() {
+        let identity = "USB-SERIAL-123";
+        let hash = "a".repeat(64);
+        let phrase = erase_confirmation_phrase(4, identity, &hash);
+        assert!(validate_erase_confirmation(4, identity, &hash, &phrase).is_ok());
+        assert!(validate_erase_confirmation(4, identity, &hash, "ERASE DISK 4").is_err());
+        assert!(validate_erase_confirmation(5, identity, &hash, &phrase).is_err());
+        assert!(validate_erase_confirmation(4, "USB-SERIAL-456", &hash, &phrase).is_err());
+        assert!(validate_erase_confirmation(4, identity, &"b".repeat(64), &phrase).is_err());
+        assert!(validate_erase_confirmation(4, identity, "not-a-hash", &phrase).is_err());
+        assert!(validate_erase_confirmation(4, " ", &hash, &phrase).is_err());
     }
 
     #[test]
