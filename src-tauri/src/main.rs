@@ -89,10 +89,18 @@ fn drive_helper_path() -> Result<std::path::PathBuf, String> {
     Err("AllBoot Drive Helper currently supports Windows and macOS.".into())
 }
 
+const HELPER_VERSION_MARKER: &str = "ALLBOOT_DRIVE_HELPER_VERSION=1";
+
+fn helper_version_supported(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|line| line.trim_start_matches('#').trim() == HELPER_VERSION_MARKER)
+}
 #[tauri::command]
 fn drive_helper_installed() -> bool {
     drive_helper_path()
-        .map(|path| path.is_file())
+        .and_then(|path| std::fs::read_to_string(path).map_err(|e| e.to_string()))
+        .map(|contents| helper_version_supported(&contents))
         .unwrap_or(false)
 }
 
@@ -107,13 +115,18 @@ fn install_drive_helper() -> Result<String, String> {
 
     #[cfg(target_os = "windows")]
     {
-        let script = "$ErrorActionPreference = 'Stop'; $disks = @(Get-Disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem); ConvertTo-Json -InputObject $disks -Compress";
+        let script = r#"# ALLBOOT_DRIVE_HELPER_VERSION=1
+$ErrorActionPreference = 'Stop'
+$disks = @(Get-Disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem)
+ConvertTo-Json -InputObject $disks -Compress
+"#;
         std::fs::write(&path, script)
             .map_err(|e| format!("Could not install the Windows drive helper: {e}"))?;
     }
     #[cfg(target_os = "macos")]
     {
         let script = r#"#!/bin/sh
+# ALLBOOT_DRIVE_HELPER_VERSION=1
 set -eu
 action="$1"
 case "$action" in
@@ -146,6 +159,11 @@ esac
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("Could not make the macOS helper executable: {e}"))?;
+    }
+    let installed_contents = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Could not verify the installed helper contents: {e}"))?;
+    if !helper_version_supported(&installed_contents) {
+        return Err("The installed drive helper failed its version check.".into());
     }
     if !path.is_file() {
         return Err("The helper could not be verified after installation.".into());
@@ -648,6 +666,22 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    #[test]
+    fn drive_helper_installation_requires_the_expected_version_marker() {
+        assert!(helper_version_supported(
+            "# ALLBOOT_DRIVE_HELPER_VERSION=1\nGet-Disk"
+        ));
+        assert!(helper_version_supported(
+            "ALLBOOT_DRIVE_HELPER_VERSION=1\nset -eu"
+        ));
+        assert!(!helper_version_supported("Get-Disk"));
+        assert!(!helper_version_supported(
+            "# ALLBOOT_DRIVE_HELPER_VERSION=2"
+        ));
+        assert!(!helper_version_supported(
+            "# not ALLBOOT_DRIVE_HELPER_VERSION=1"
+        ));
+    }
     #[test]
     fn macos_whole_disk_identifier_rejects_partition_and_malformed_names() {
         assert!(is_whole_macos_disk_identifier("disk0"));
