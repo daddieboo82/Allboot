@@ -105,6 +105,9 @@ fn verified_drive_helper_path() -> Result<std::path::PathBuf, String> {
     }
     Ok(path)
 }
+fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    before.len() == after.len() && before.modified().ok() == after.modified().ok()
+}
 fn helper_version_supported(contents: &str) -> bool {
     contents
         .lines()
@@ -428,6 +431,11 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         }
         hasher.update(&buffer[..count]);
     }
+    let after_hash_metadata = std::fs::metadata(image_path)
+        .map_err(|e| format!("Could not re-check image after hashing: {e}"))?;
+    if !file_metadata_unchanged(&metadata, &after_hash_metadata) {
+        return Err("The image changed while AllBoot was inspecting it. Re-select the file and inspect it again. Nothing was written.".into());
+    }
     let sha256 = format!("{:x}", hasher.finalize());
 
     let mut pvd = [0_u8; 6];
@@ -708,6 +716,24 @@ mod tests {
         assert!(!helper_version_supported(
             "# not ALLBOOT_DRIVE_HELPER_VERSION=1"
         ));
+    }
+    #[test]
+    fn image_metadata_change_during_inspection_is_detected() {
+        let path = std::env::temp_dir().join(format!(
+            "allboot-image-stability-{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"initial image bytes").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"changed").unwrap();
+        drop(file);
+        let after = std::fs::metadata(&path).unwrap();
+        assert!(!file_metadata_unchanged(&before, &after));
+        std::fs::remove_file(path).unwrap();
     }
     #[test]
     fn macos_drive_filter_accepts_only_usb_bus_protocol() {
