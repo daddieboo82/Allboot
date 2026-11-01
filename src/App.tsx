@@ -1,54 +1,27 @@
-import { useMemo, useState } from 'react';
-import { Activity, ArrowRight, CheckCircle2, Disc3, HardDrive, History, Layers3, Monitor, Settings2, ShieldCheck, Sparkles, Usb, X } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
+import { Activity, ArrowRight, CheckCircle2, Disc3, HardDrive, History, Layers3, Monitor, RefreshCw, Settings2, ShieldCheck, Sparkles, Usb } from 'lucide-react';
 
-type PickedImage = { name: string; size: number };
-const extensions = ['iso','img','dmg','raw','bin','vhd','vhdx','wim','esd'];
-const sizeLabel = (n:number) => n >= 1024 ** 3 ? (n / 1024 ** 3).toFixed(2) + ' GB' : (n / 1024 ** 2).toFixed(1) + ' MB';
+type Drive = { diskNumber:number; name:string; busType:string; sizeBytes:number; serialNumber:string; uniqueId:string; partitionStyle:string; isBoot:boolean; isSystem:boolean };
+type Inspection = { name:string; path:string; sizeBytes:number; extension:string; detectedFormat:string; iso9660Signature:boolean; elToritoBootRecord:boolean; udifSignature:boolean; macosCandidate:boolean; sha256:string; bootability:string };
+type Preflight = { diskNumber:number; driveName:string; diskSizeBytes:number; imageName:string; imageSizeBytes:number; imageSha256:string; confirmationPhrase:string; checks:string[] };
+const fmt=(n:number)=>n>=1024**3?(n/1024**3).toFixed(2)+' GB':(n/1024**2).toFixed(1)+' MB';
 
 export default function App() {
-  const [file,setFile] = useState<PickedImage|null>(null);
-  const [tab,setTab] = useState('Create media');
-  const [drag,setDrag] = useState(false);
-  const [notice,setNotice] = useState('');
-  const [confirm,setConfirm] = useState(false);
-  const accepted = useMemo(() => !!file && extensions.some(ext => file.name.toLowerCase().endsWith('.'+ext)),[file]);
-  function choose(f?:File) {
-    if (!f) return;
-    if (!extensions.some(ext => f.name.toLowerCase().endsWith('.'+ext))) { setNotice('This file extension is not in the current candidate list.'); return; }
-    setFile({name:f.name,size:f.size}); setNotice('Image selected. Compatibility inspection requires the desktop engine.');
-  }
-  const nav = [{label:'Create media',icon:Disc3},{label:'My drives',icon:HardDrive},{label:'Creation history',icon:History},{label:'AI assistant',icon:Sparkles}];
-  return <div className="app-shell">
-    <aside className="sidebar">
-      <div className="brand"><div className="brand-icon"><Layers3/></div><div><b>ALLBOOT</b><small>ISO MAKER</small></div></div>
-      <div className="nav-caption">WORKSPACE</div>
-      {nav.map(({label,icon:Icon})=><button key={label} className={'nav-link '+(tab===label?'selected':'')} onClick={()=>setTab(label)}><Icon size={17}/>{label}</button>)}
-      <div className="sidebar-bottom"><div className="engine-status"><span className="status-light"/><div><b>Native engine</b><small>Not connected in web preview</small></div></div><button className="nav-link" onClick={()=>setTab('Settings')}><Settings2 size={17}/>Settings</button><small className="version">ALLBOOT · PREVIEW 0.1.0</small></div>
-    </aside>
-    <main className="main-area">
-      <header className="topbar"><div className="crumb">Workspace <span>/</span> <b>{tab}</b></div><div className="top-right"><span><ShieldCheck size={15}/> Local-first workflow</span><div className="avatar">AB</div></div></header>
-      {tab==='Create media' ? <>
-        <section className="hero"><div className="eyebrow"><i/> UNIVERSAL BOOT MEDIA WORKSPACE</div><h1>Make any drive<br/><em>boot-ready.</em></h1><p>Prepare bootable USB drives, HDDs and SSDs from operating-system images with one guided workflow.</p><div className="platform-chips"><span><Monitor size={14}/> Windows</span><span>◈ Linux</span><span>◉ macOS</span><span>＋ Other compatible images</span></div></section>
-        <section className="work-grid">
-          <article className="panel"><div className="panel-heading"><div><small>01 · SOURCE IMAGE</small><h2>Choose your image</h2></div><label>REQUIRED</label></div>
-            <label className={'drop-area '+(drag?'dragging':'')} onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);choose(e.dataTransfer.files[0]);}}>
-              <input type="file" accept={extensions.map(x=>'.'+x).join(',')} onChange={e=>choose(e.target.files?.[0])}/>
-              <div className="upload-glyph">↑</div><b>{file?.name || 'Drop your image file here'}</b><span>{file ? sizeLabel(file.size) : 'or click to browse your computer'}</span><small>ISO · IMG · DMG · RAW · BIN · VHD · WIM · ESD</small>
-            </label>
-            {file && <div className="picked-file"><Disc3 size={17}/><div><b>{file.name}</b><small>{sizeLabel(file.size)}</small></div><button onClick={()=>setFile(null)} aria-label="Remove image"><X size={16}/></button></div>}
-            <div className="hint"><Sparkles size={15}/> Image structure and boot compatibility will be inspected before writing.</div>
-          </article>
-          <article className="panel"><div className="panel-heading"><div><small>02 · DESTINATION</small><h2>Select a drive</h2></div><label>REQUIRED</label></div>
-            <div className="drive-placeholder"><div className="drive-icon"><Usb size={28}/></div><b>Waiting for a connected drive</b><p>USB, HDD and SSD detection is provided by the native desktop engine—not this browser preview.</p><small><Activity size={13}/> DEVICE SCAN NOT AVAILABLE IN WEB PREVIEW</small></div>
-            <div className="field-label">DESTINATION DRIVE</div><select disabled><option>Connect a drive in the desktop app</option></select>
-            <div className="warning"><ShieldCheck size={16}/> Writing can erase all data on the selected destination. Exact device identity must be confirmed.</div>
-          </article>
-        </section>
-        <section className="bottom-bar"><div className="safety"><CheckCircle2 size={19}/><div><b>Safety-first workflow</b><small>Image validation · Device identity · Write verification</small></div></div><button className="primary" disabled={!accepted} onClick={()=>setConfirm(true)}>Review preparation <ArrowRight size={17}/></button></section>
-        {notice && <p className="notice">{notice}</p>}
-      </> : <section className="placeholder"><div className="placeholder-icon"><Sparkles/></div><h2>{tab}</h2><p>This workspace will be available when the native desktop engine and supporting services are implemented.</p><button className="secondary" onClick={()=>setTab('Create media')}>Back to create media</button></section>}
-      <footer><span>ALLBOOT ISO MAKER</span><span>UNIVERSAL BOOT MEDIA <i>·</i> DESKTOP PREVIEW</span></footer>
-    </main>
-    {confirm && <div className="modal-backdrop" role="presentation"><div className="modal" role="dialog" aria-modal="true"><div className="modal-symbol"><ShieldCheck/></div><h2>Desktop engine required</h2><p><b>{file?.name}</b> is selected. This preview cannot enumerate physical drives, partition disks or write images. No drive has been modified.</p><button className="primary modal-button" onClick={()=>setConfirm(false)}>Got it</button></div></div>}
-  </div>;
+ const [tab,setTab]=useState('Create media'),[image,setImage]=useState<Inspection|null>(null),[drives,setDrives]=useState<Drive[]>([]),[selected,setSelected]=useState<number|null>(null),[preflight,setPreflight]=useState<Preflight|null>(null),[loading,setLoading]=useState(false),[error,setError]=useState(''),[status,setStatus]=useState('Native engine ready'),[native,setNative]=useState(false);
+ async function scan(){setLoading(true);setError('');setPreflight(null);try{const found=await invoke<Drive[]>('list_destination_drives');setDrives(found);setSelected(current=>found.some(d=>d.diskNumber===current)?current:null);setStatus(found.length+' eligible USB drive(s) detected');}catch(e){setError(String(e));setStatus('Drive scan unavailable');}finally{setLoading(false);}}
+ async function chooseImage(){setError('');setPreflight(null);try{const path=await open({multiple:false,directory:false,filters:[{name:'Disk images',extensions:['iso','img','dmg','raw','bin','vhd','vhdx','wim','esd']}]});if(!path||Array.isArray(path))return;setStatus('Inspecting image and calculating SHA-256…');const inspected=await invoke<Inspection>('inspect_image',{path});setImage(inspected);setStatus('Image inspection complete — writing is not enabled yet');}catch(e){setError(String(e));setStatus('Image inspection failed');}}
+ async function reviewPreparation(){if(!image||!active)return;setLoading(true);setError('');setPreflight(null);setStatus('Re-checking USB identity and image integrity…');try{const result=await invoke<Preflight>('preflight_write',{diskNumber:active.diskNumber,expectedUniqueId:active.uniqueId,imagePath:image.path});setPreflight(result);setStatus('Safe preflight passed — no data was written');}catch(e){setError(String(e));setStatus('Preflight blocked — no data was written');}finally{setLoading(false);}}
+ useEffect(()=>{const isTauri=typeof window!=='undefined'&&'__TAURI_INTERNALS__' in window;setNative(isTauri);if(isTauri)void scan();},[]);
+ const active=drives.find(d=>d.diskNumber===selected),nav=[{label:'Create media',icon:Disc3},{label:'My drives',icon:HardDrive},{label:'Creation history',icon:History},{label:'AI assistant',icon:Sparkles}];
+ return <div className="app-shell"><aside className="sidebar"><div className="brand"><div className="brand-icon"><Layers3/></div><div><b>ALLBOOT</b><small>ISO MAKER</small></div></div><div className="nav-caption">WORKSPACE</div>{nav.map(({label,icon:Icon})=><button key={label} className={'nav-link '+(tab===label?'selected':'')} onClick={()=>setTab(label)}><Icon size={17}/>{label}</button>)}<div className="sidebar-bottom"><div className="engine-status"><span className="status-light"/><div><b>Native engine</b><small>{native?'Connected':'Open the desktop app'}</small></div></div><button className="nav-link" onClick={()=>setTab('Settings')}><Settings2 size={17}/>Settings</button><small className="version">ALLBOOT · 0.1.0</small></div></aside>
+ <main className="main-area"><header className="topbar"><div className="crumb">Workspace <span>/</span> <b>{tab}</b></div><div className="top-right"><span><ShieldCheck size={15}/> Local-first workflow</span><div className="avatar">AB</div></div></header>
+ {tab==='Create media'||tab==='My drives'?<><section className="hero"><div className="eyebrow"><i/> UNIVERSAL BOOT MEDIA WORKSPACE</div><h1>Make any drive<br/><em>boot-ready.</em></h1><p>AllBoot guides image selection and USB identification locally. No terminal commands required.</p><div className="platform-chips"><span><Monitor size={14}/> Windows</span><span>◈ Linux</span><span>◉ macOS</span><span>＋ Other compatible images</span></div></section>
+ <section className="work-grid"><article className="panel"><div className="panel-heading"><div><small>01 · SOURCE IMAGE</small><h2>Choose your image</h2></div><label>REQUIRED</label></div><button className="drop-area" onClick={()=>void chooseImage()}><div className="upload-glyph">↑</div><b>{image?.name||'Choose an image file'}</b><span>{image?fmt(image.sizeBytes):'Click to browse your computer'}</span><small>ISO · IMG · DMG · RAW · BIN · VHD · WIM · ESD</small></button>{image&&<div className="picked-file"><Disc3 size={17}/><div><b>{image.detectedFormat}</b><small>{image.bootability}</small><small className="hash">SHA-256 · {image.sha256}</small></div></div>}<div className="hint"><Sparkles size={15}/>{image?'Image signature checks and SHA-256 complete. Bootability still requires platform-specific validation.':'Image structure and source hash will be inspected before any preparation.'}</div></article>
+ <article className="panel"><div className="panel-heading"><div><small>02 · DESTINATION</small><h2>Select a USB drive</h2></div><button className="scan-button" onClick={()=>void scan()} disabled={!native||loading}><RefreshCw size={14}/>{loading?'Scanning':'Scan'}</button></div><div className="drive-list">{drives.length?drives.map(d=><button key={d.diskNumber} className={'drive-option '+(selected===d.diskNumber?'active':'')} onClick={()=>{setSelected(d.diskNumber);setPreflight(null);}}><Usb size={22}/><span><b>{d.name}</b><small>Disk {d.diskNumber} · {fmt(d.sizeBytes)} · {d.partitionStyle||'Uninitialized'}</small></span><i>{selected===d.diskNumber?'SELECTED':'USB'}</i></button>):<div className="drive-placeholder"><div className="drive-icon"><Usb size={28}/></div><b>{native?'No eligible USB drive found':'Waiting for desktop engine'}</b><p>{native?'Connect a USB drive, then scan again. System and boot disks are excluded.':'Open AllBoot as a desktop app to inspect connected USB drives.'}</p><small><Activity size={13}/>{native?'LIVE DEVICE DISCOVERY':'WEB PREVIEW ONLY'}</small></div>}</div><div className="field-label">DESTINATION IDENTITY</div><div className="identity">{active?('Disk '+active.diskNumber+' · '+active.name+' · '+fmt(active.sizeBytes)+' · '+(active.uniqueId||active.serialNumber||'No serial identifier reported')):'Select a detected drive to view its identity.'}</div><div className="warning"><ShieldCheck size={16}/> The destination will eventually be erased. AllBoot must re-check this exact device immediately before any write.</div></article></section>
+ <section className="bottom-bar"><div className="safety"><CheckCircle2 size={19}/><div><b>Read-only inspection & preflight</b><small>Image signatures · SHA-256 · USB identity · System disk exclusion</small></div></div><button className="primary" disabled={!image||!active||!native||loading} onClick={()=>void reviewPreparation()}>{loading?'Checking…':'Run safe preflight'} <ArrowRight size={17}/></button></section>
+ {preflight&&<section className="preflight-result"><div className="preflight-title"><CheckCircle2 size={18}/><b>Preflight passed — no data was written</b></div><p>Verified <b>{preflight.driveName}</b> (Disk {preflight.diskNumber}, {fmt(preflight.diskSizeBytes)}) against <b>{preflight.imageName}</b> ({fmt(preflight.imageSizeBytes)}).</p><ul>{preflight.checks.map(check=><li key={check}>{check}</li>)}</ul><div className="confirm-label">FUTURE ERASE CONFIRMATION PHRASE</div><code>{preflight.confirmationPhrase}</code><small>Writing is still disabled. This phrase is a safeguard for the future write step, not permission to erase the drive now.</small></section>}
+ {error&&<p className="notice error">{error}</p>}<p className="notice">{status}</p></>:<section className="placeholder"><div className="placeholder-icon"><Sparkles/></div><h2>{tab}</h2><p>This workspace will be enabled after the core media-writing and verification engine is complete.</p><button className="secondary" onClick={()=>setTab('Create media')}>Back to create media</button></section>}
+ <footer><span>ALLBOOT ISO MAKER</span><span>UNIVERSAL BOOT MEDIA <i>·</i> NATIVE DESKTOP</span></footer></main></div>;
 }
