@@ -247,6 +247,24 @@ fn verify_image_readback<R: Read>(
     }
     Ok(actual)
 }
+fn erase_confirmation_phrase(
+    disk_number: u32,
+    stable_identity: &str,
+    image_sha256: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ALLBOOT-ERASE-CONFIRMATION-V1\0");
+    hasher.update(disk_number.to_le_bytes());
+    hasher.update(stable_identity.trim().as_bytes());
+    hasher.update([0]);
+    hasher.update(image_sha256.trim().to_ascii_lowercase().as_bytes());
+    let digest = hasher.finalize();
+    let challenge = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>();
+    format!("ERASE DISK {disk_number} {challenge}")
+}
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
@@ -877,6 +895,7 @@ fn preflight_write(
             image.udif_signature,
         )
         .to_string();
+        let confirmation_phrase = erase_confirmation_phrase(disk_number, &actual_id, &image.sha256);
         Ok(PreflightReport {
             disk_number,
             drive_name: disk
@@ -887,7 +906,7 @@ fn preflight_write(
             image_size_bytes: image.size_bytes,
             image_sha256: image.sha256,
             write_readiness,
-            confirmation_phrase: format!("ERASE DISK {}", disk_number),
+            confirmation_phrase,
             checks: vec![
                 "Destination re-queried immediately before preparation".into(),
                 "USB bus type confirmed".into(),
@@ -989,6 +1008,7 @@ fn preflight_write(
             image.udif_signature,
         )
         .to_string();
+        let confirmation_phrase = erase_confirmation_phrase(disk_number, &stable_id, &image.sha256);
         Ok(PreflightReport {
             disk_number,
             drive_name: detail
@@ -1001,7 +1021,7 @@ fn preflight_write(
             image_size_bytes: image.size_bytes,
             image_sha256: image.sha256,
             write_readiness,
-            confirmation_phrase: format!("ERASE DISK {}", disk_number),
+            confirmation_phrase,
             checks: vec![
                 "External physical disk re-queried immediately before preparation".into(),
                 format!("External connection protocol confirmed: {}", bus),
@@ -1338,10 +1358,10 @@ mod tests {
             )
             .expect("matching USB identity should pass read-only preflight");
             assert_eq!(report.disk_number, drive.disk_number);
-            assert_eq!(
-                report.confirmation_phrase,
-                format!("ERASE DISK {}", drive.disk_number)
-            );
+            assert!(report
+                .confirmation_phrase
+                .starts_with(&format!("ERASE DISK {} ", drive.disk_number)));
+            assert_eq!(report.confirmation_phrase.split_whitespace().count(), 4);
             let mismatch = preflight_write(
                 drive.disk_number,
                 "not-the-real-device-id".into(),
@@ -1382,6 +1402,28 @@ mod tests {
                 "startup disk must not be selectable"
             );
         }
+    }
+
+    #[test]
+    fn erase_confirmation_is_bound_to_disk_identity_and_image_hash() {
+        let identity = "USB-SERIAL-123";
+        let image_hash = "a".repeat(64);
+        let phrase = erase_confirmation_phrase(4, identity, &image_hash);
+        assert!(phrase.starts_with("ERASE DISK 4 "));
+        assert_eq!(phrase, erase_confirmation_phrase(4, identity, &image_hash));
+        assert_ne!(phrase, erase_confirmation_phrase(5, identity, &image_hash));
+        assert_ne!(
+            phrase,
+            erase_confirmation_phrase(4, "USB-SERIAL-456", &image_hash)
+        );
+        assert_ne!(
+            phrase,
+            erase_confirmation_phrase(4, identity, &"b".repeat(64))
+        );
+        assert_ne!(
+            phrase,
+            erase_confirmation_phrase(4, "usb-serial-123", &image_hash)
+        );
     }
 
     #[test]
