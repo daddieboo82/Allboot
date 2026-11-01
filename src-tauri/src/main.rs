@@ -203,6 +203,50 @@ where
     Ok(written)
 }
 
+#[allow(dead_code)]
+fn verify_image_readback<R: Read>(
+    reader: &mut R,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<String, String> {
+    const CHUNK_SIZE: usize = 1024 * 1024;
+    let mut buffer = vec![0_u8; CHUNK_SIZE];
+    let mut verified = 0_u64;
+    let mut hasher = Sha256::new();
+    while verified < expected_size {
+        let remaining = expected_size - verified;
+        let requested = usize::try_from(remaining.min(CHUNK_SIZE as u64))
+            .map_err(|_| "Read-back chunk size is not representable.".to_string())?;
+        let count = reader
+            .read(&mut buffer[..requested])
+            .map_err(|e| format!("Could not read destination for verification: {e}"))?;
+        if count == 0 {
+            return Err(format!(
+                "Destination read-back ended early: expected {expected_size}, verified {verified}."
+            ));
+        }
+        hasher.update(&buffer[..count]);
+        verified = verified
+            .checked_add(count as u64)
+            .ok_or_else(|| "Read-back byte counter overflowed.".to_string())?;
+    }
+    let mut extra = [0_u8; 1];
+    if reader
+        .read(&mut extra)
+        .map_err(|e| format!("Could not verify destination length: {e}"))?
+        != 0
+    {
+        return Err("Destination contains more data than the source image.".into());
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected_sha256.trim()) {
+        return Err(format!(
+            "Destination SHA-256 mismatch: expected {}, read back {actual}.",
+            expected_sha256.trim()
+        ));
+    }
+    Ok(actual)
+}
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
@@ -1338,6 +1382,43 @@ mod tests {
                 "startup disk must not be selectable"
             );
         }
+    }
+
+    #[test]
+    fn readback_verification_accepts_exact_matching_image() {
+        let bytes = b"AllBoot read-back verification test image";
+        let expected = format!("{:x}", Sha256::digest(bytes));
+        let mut reader = std::io::Cursor::new(bytes.to_vec());
+        assert_eq!(
+            verify_image_readback(&mut reader, bytes.len() as u64, &expected).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn readback_verification_rejects_corruption_and_wrong_length() {
+        let bytes = b"AllBoot read-back verification test image";
+        let expected = format!("{:x}", Sha256::digest(bytes));
+        let mut corrupted = bytes.to_vec();
+        corrupted[5] ^= 0xFF;
+        let mut reader = std::io::Cursor::new(corrupted);
+        assert!(
+            verify_image_readback(&mut reader, bytes.len() as u64, &expected)
+                .unwrap_err()
+                .contains("SHA-256 mismatch")
+        );
+        let mut truncated = std::io::Cursor::new(bytes[..8].to_vec());
+        assert!(
+            verify_image_readback(&mut truncated, bytes.len() as u64, &expected)
+                .unwrap_err()
+                .contains("ended early")
+        );
+        let mut extended = std::io::Cursor::new([bytes.as_slice(), b"x"].concat());
+        assert!(
+            verify_image_readback(&mut extended, bytes.len() as u64, &expected)
+                .unwrap_err()
+                .contains("more data")
+        );
     }
 
     #[test]
