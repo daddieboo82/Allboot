@@ -350,9 +350,7 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or(identifier);
             let is_boot = actual_id == boot_disk;
-            if internal || !whole || is_boot {
-                continue;
-            }
+
             let bus = detail
                 .get("BusProtocol")
                 .or_else(|| detail.get("Protocol"))
@@ -378,6 +376,9 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                 Some(value) => value,
                 None => continue,
             };
+            if !macos_disk_is_eligible(internal, whole, is_boot, bus, !stable_id.is_empty()) {
+                continue;
+            }
 
             let serial = detail
                 .get("SerialNumber")
