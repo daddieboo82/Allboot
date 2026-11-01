@@ -205,18 +205,13 @@ fn image_write_compatibility(
     }
 }
 
-#[cfg(target_os = "windows")]
-fn drive_helper_source() -> &'static str {
-    r#"# ALLBOOT_DRIVE_HELPER_VERSION=1
+const WINDOWS_DRIVE_HELPER_SOURCE: &str = r#"# ALLBOOT_DRIVE_HELPER_VERSION=1
 $ErrorActionPreference = 'Stop'
 $disks = @(Get-Disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem)
 ConvertTo-Json -InputObject $disks -Compress
-"#
-}
+"#;
 
-#[cfg(target_os = "macos")]
-fn drive_helper_source() -> &'static str {
-    r#"#!/bin/sh
+const MACOS_DRIVE_HELPER_SOURCE: &str = r#"#!/bin/sh
 # ALLBOOT_DRIVE_HELPER_VERSION=1
 set -eu
 action="$1"
@@ -244,7 +239,16 @@ case "$action" in
     exit 2
     ;;
 esac
-"#
+"#;
+
+#[cfg(target_os = "windows")]
+fn drive_helper_source() -> &'static str {
+    WINDOWS_DRIVE_HELPER_SOURCE
+}
+
+#[cfg(target_os = "macos")]
+fn drive_helper_source() -> &'static str {
+    MACOS_DRIVE_HELPER_SOURCE
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -1278,6 +1282,42 @@ mod tests {
             assert!(
                 !drive.is_boot && !drive.is_system,
                 "startup disk must not be selectable"
+            );
+        }
+    }
+
+    #[test]
+    fn both_platform_helpers_are_versioned_and_discovery_only() {
+        assert!(WINDOWS_DRIVE_HELPER_SOURCE.contains("# ALLBOOT_DRIVE_HELPER_VERSION=1"));
+        assert!(WINDOWS_DRIVE_HELPER_SOURCE.contains("Get-Disk"));
+        assert!(WINDOWS_DRIVE_HELPER_SOURCE.contains("ConvertTo-Json"));
+        for forbidden in [
+            "Clear-Disk",
+            "Format-Volume",
+            "Initialize-Disk",
+            "Remove-Partition",
+            "Set-Disk",
+            "Remove-Item",
+        ] {
+            assert!(
+                !WINDOWS_DRIVE_HELPER_SOURCE.contains(forbidden),
+                "Windows helper must not contain {forbidden}"
+            );
+        }
+        assert!(MACOS_DRIVE_HELPER_SOURCE.contains("# ALLBOOT_DRIVE_HELPER_VERSION=1"));
+        assert!(MACOS_DRIVE_HELPER_SOURCE.contains("diskutil list -plist external physical"));
+        assert!(MACOS_DRIVE_HELPER_SOURCE.contains("diskutil info -plist"));
+        assert!(MACOS_DRIVE_HELPER_SOURCE.contains("diskutil info -plist /"));
+        for forbidden in [
+            "diskutil eraseDisk",
+            "diskutil partitionDisk",
+            "diskutil apfs deleteContainer",
+            "diskutil unmountDisk",
+            "diskutil eject",
+        ] {
+            assert!(
+                !MACOS_DRIVE_HELPER_SOURCE.contains(forbidden),
+                "macOS helper must not contain {forbidden}"
             );
         }
     }
