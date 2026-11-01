@@ -105,6 +105,20 @@ fn verified_drive_helper_path() -> Result<std::path::PathBuf, String> {
     }
     Ok(path)
 }
+#[cfg(any(target_os = "windows", test))]
+fn windows_disk_is_eligible(
+    bus_type: &str,
+    is_boot: bool,
+    is_system: bool,
+    unique_id: &str,
+    size_bytes: u64,
+) -> bool {
+    bus_type.eq_ignore_ascii_case("USB")
+        && !is_boot
+        && !is_system
+        && !unique_id.trim().is_empty()
+        && size_bytes > 0
+}
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
@@ -279,7 +293,9 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
             let bus_type = disk.bus_type.unwrap_or_default();
             let is_boot = disk.is_boot.unwrap_or(false);
             let is_system = disk.is_system.unwrap_or(false);
-            if !bus_type.eq_ignore_ascii_case("USB") || is_boot || is_system {
+            let unique_id = disk.unique_id.as_deref().unwrap_or("");
+            let size_bytes = disk.size.unwrap_or(0);
+            if !windows_disk_is_eligible(&bus_type, is_boot, is_system, unique_id, size_bytes) {
                 continue;
             }
             result.push(DestinationDrive {
@@ -288,9 +304,9 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                     .friendly_name
                     .unwrap_or_else(|| "USB storage device".into()),
                 bus_type,
-                size_bytes: disk.size.unwrap_or(0),
+                size_bytes,
                 serial_number: disk.serial_number.unwrap_or_default(),
-                unique_id: disk.unique_id.unwrap_or_default(),
+                unique_id: unique_id.to_string(),
                 partition_style: disk.partition_style.unwrap_or_default(),
                 is_boot,
                 is_system,
@@ -582,6 +598,15 @@ fn preflight_write(
             return Err("Safety check blocked this device because Windows identifies it as a boot or system disk. Nothing was written.".into());
         }
         let actual_id = disk.unique_id.unwrap_or_default();
+        if !windows_disk_is_eligible(
+            &bus_type,
+            disk.is_boot.unwrap_or(false),
+            disk.is_system.unwrap_or(false),
+            &actual_id,
+            disk.size.unwrap_or(0),
+        ) {
+            return Err("The selected USB disk no longer meets AllBoot's identity, capacity, or system-disk safety checks. Nothing was written.".into());
+        }
         if expected_unique_id.trim().is_empty()
             || !actual_id.eq_ignore_ascii_case(expected_unique_id.trim())
         {
@@ -763,6 +788,46 @@ mod tests {
         let after = std::fs::metadata(&path).unwrap();
         assert!(!file_metadata_unchanged(&before, &after));
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn windows_disk_eligibility_requires_usb_identity_and_safe_capacity() {
+        assert!(windows_disk_is_eligible(
+            "USB",
+            false,
+            false,
+            "USB-SERIAL-1",
+            1024
+        ));
+        assert!(!windows_disk_is_eligible(
+            "SATA",
+            false,
+            false,
+            "USB-SERIAL-1",
+            1024
+        ));
+        assert!(!windows_disk_is_eligible(
+            "USB",
+            true,
+            false,
+            "USB-SERIAL-1",
+            1024
+        ));
+        assert!(!windows_disk_is_eligible(
+            "USB",
+            false,
+            true,
+            "USB-SERIAL-1",
+            1024
+        ));
+        assert!(!windows_disk_is_eligible("USB", false, false, "", 1024));
+        assert!(!windows_disk_is_eligible("USB", false, false, "   ", 1024));
+        assert!(!windows_disk_is_eligible(
+            "USB",
+            false,
+            false,
+            "USB-SERIAL-1",
+            0
+        ));
     }
     #[test]
     fn macos_disk_eligibility_requires_every_safety_condition() {
