@@ -98,6 +98,15 @@ esac
     if !path.is_file() { return Err("The helper could not be verified after installation.".into()); }
     Ok(path.to_string_lossy().to_string())
 }
+#[cfg(any(target_os = "macos", test))]
+fn parent_disk_identifier(volume_id: &str) -> Option<String> {
+    let rest = volume_id.strip_prefix("disk")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { return None; }
+    let suffix = &rest[digits.len()..];
+    if !suffix.is_empty() && !suffix.starts_with('s') { return None; }
+    Some(format!("disk{}", digits))
+}
 #[tauri::command]
 fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
     #[cfg(target_os = "windows")]
@@ -138,9 +147,12 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
             serde_json::from_slice(&output.stdout).map_err(|e| format!("Could not parse macOS disk information: {e}"))
         };
         let inventory = run(&["list"])?;
-        let boot_info = run(&["boot"]).unwrap_or(serde_json::Value::Null);
-        let boot_volume = boot_info.get("DeviceIdentifier").and_then(|v| v.as_str()).unwrap_or("");
-        let boot_disk = boot_volume.split('s').next().unwrap_or(boot_volume);
+        let boot_info = run(&["boot"])?;
+        let boot_volume = boot_info.get("DeviceIdentifier").and_then(|v| v.as_str())
+            .or_else(|| boot_info.get("PartOfWhole").and_then(|v| v.as_str()))
+            .ok_or_else(|| "Could not identify the current macOS startup volume; discovery is blocked for safety.".to_string())?;
+        let boot_disk = parent_disk_identifier(boot_volume)
+            .ok_or_else(|| "Could not identify the parent of the macOS startup volume; discovery is blocked for safety.".to_string())?;
         let disks = inventory.get("AllDisksAndPartitions").and_then(|v| v.as_array())
             .ok_or_else(|| "macOS returned no external physical disk list.".to_string())?;
         let mut result = Vec::new();
@@ -298,9 +310,12 @@ fn preflight_write(disk_number: u32, expected_unique_id: String, image_path: Str
             serde_json::from_slice(&output.stdout).map_err(|e| format!("Could not parse macOS disk identity: {e}"))
         };
         let detail = run_info("info", Some(&disk_id))?;
-        let boot = run_info("boot", None).unwrap_or(serde_json::Value::Null);
-        let boot_volume = boot.get("DeviceIdentifier").and_then(|v| v.as_str()).unwrap_or("");
-        let boot_disk = boot_volume.split('s').next().unwrap_or(boot_volume);
+        let boot = run_info("boot", None)?;
+        let boot_volume = boot.get("DeviceIdentifier").and_then(|v| v.as_str())
+            .or_else(|| boot.get("PartOfWhole").and_then(|v| v.as_str()))
+            .ok_or_else(|| "Could not identify the current macOS startup volume. Nothing was written.".to_string())?;
+        let boot_disk = parent_disk_identifier(boot_volume)
+            .ok_or_else(|| "Could not identify the parent of the macOS startup volume. Nothing was written.".to_string())?;
         let actual_id = detail.get("DeviceIdentifier").and_then(|v| v.as_str()).unwrap_or("");
         let internal = detail.get("Internal").and_then(|v| v.as_bool()).unwrap_or(true);
         let whole = detail.get("Whole").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -346,7 +361,15 @@ mod tests {
     use std::{fs, time::{SystemTime, UNIX_EPOCH}};
 
     #[test]
-    fn detects_iso9660_and_el_torito_and_hashes_source() {
+    fn parses_macos_startup_volume_parent_disk() {
+        assert_eq!(parent_disk_identifier("disk3s5"), Some("disk3".into()));
+        assert_eq!(parent_disk_identifier("disk12s1"), Some("disk12".into()));
+        assert_eq!(parent_disk_identifier("disk0"), Some("disk0".into()));
+        assert_eq!(parent_disk_identifier("not-a-disk"), None);
+        assert_eq!(parent_disk_identifier("diskx1"), None);
+    }
+
+    #[test]    fn detects_iso9660_and_el_torito_and_hashes_source() {
         let path = std::env::temp_dir().join(format!("allboot-test-{}.iso", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
         let mut bytes = vec![0_u8; 34_855];
         bytes[32_768] = 1;
