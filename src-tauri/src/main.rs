@@ -32,12 +32,39 @@ struct PreflightReport {
     confirmation_phrase: String, checks: Vec<String>,
 }
 
+fn drive_helper_path() -> Result<std::path::PathBuf, String> {
+    let local = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| "Windows local application-data folder is unavailable.".to_string())?;
+    Ok(std::path::PathBuf::from(local).join("AllBoot").join("DriveHelper").join("AllBootDriveHelper.ps1"))
+}
+
+#[tauri::command]
+fn drive_helper_installed() -> bool {
+    drive_helper_path().map(|path| path.is_file()).unwrap_or(false)
+}
+
+#[tauri::command]
+fn install_drive_helper() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let path = drive_helper_path()?;
+        let folder = path.parent().ok_or_else(|| "Could not determine helper installation folder.".to_string())?;
+        std::fs::create_dir_all(folder).map_err(|e| format!("Could not create the AllBoot helper folder: {e}"))?;
+        let script = "$ErrorActionPreference = 'Stop'; $disks = @(Get-Disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem); ConvertTo-Json -InputObject $disks -Compress";
+        std::fs::write(&path, script).map_err(|e| format!("Could not install the drive detection helper: {e}"))?;
+        if !path.is_file() { return Err("The helper could not be verified after installation.".into()); }
+        Ok(path.to_string_lossy().to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    { Err("The Windows drive helper is not available on this operating system.".into()) }
+}
 #[tauri::command]
 fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
     #[cfg(target_os = "windows")]
     {
-        let script = "$ErrorActionPreference='Stop'; $items=@(Get-Disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem); ConvertTo-Json -InputObject $items -Compress";
+        let script = "$ErrorActionPreference='Stop'; $helper=$env:ALLBOOT_HELPER_PATH; if (-not (Test-Path -LiteralPath $helper)) { throw 'AllBoot Drive Helper is not installed. Install it from the AllBoot setup prompt.' }; & $helper";
         let output = Command::new("powershell.exe")
+            .env("ALLBOOT_HELPER_PATH", drive_helper_path()?.to_string_lossy().to_string())
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
             .output().map_err(|e| format!("Could not enumerate disks: {e}"))?;
         if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()); }
@@ -145,6 +172,7 @@ fn preflight_write(disk_number: u32, expected_unique_id: String, image_path: Str
         let script = "$ErrorActionPreference='Stop'; $n=[uint32]$env:ALLBOOT_DISK_NUMBER; $disk=Get-Disk -Number $n; $disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem | ConvertTo-Json -Compress";
         let output = Command::new("powershell.exe")
             .env("ALLBOOT_DISK_NUMBER", disk_number.to_string())
+            .env("ALLBOOT_HELPER_PATH", drive_helper_path()?.to_string_lossy().to_string())
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
             .output().map_err(|e| format!("Could not re-check the selected disk: {e}"))?;
         if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()); }
@@ -220,6 +248,9 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn safe_preflight_rechecks_real_usb_identity_without_writing() {
+        let installed_path = install_drive_helper().expect("helper should install for the integration test");
+        assert!(std::path::Path::new(&installed_path).is_file());
+        assert!(drive_helper_installed());
         let drives = list_destination_drives().expect("USB inventory should be readable");
         for drive in &drives {
             assert!(drive.bus_type.eq_ignore_ascii_case("USB"));
@@ -253,7 +284,7 @@ mod tests {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![list_destination_drives, inspect_image, preflight_write])
+        .invoke_handler(tauri::generate_handler![list_destination_drives, drive_helper_installed, install_drive_helper, inspect_image, preflight_write])
         .run(tauri::generate_context!())
         .expect("error while running AllBoot ISO Maker");
 }

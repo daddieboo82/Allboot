@@ -57,3 +57,7 @@ The native Tauri commands require the Visual Studio Developer environment on Win
 - git diff --check — passed.
 - Windows inventory currently identifies one eligible USB destination: SanDisk 3.2Gen1, Disk 2, approximately 61.5 GB. The internal boot/system disk is excluded.
 - No USB drive has been erased or modified by AllBoot.
+
+## One-time Windows Drive Helper
+
+On first launch, AllBoot checks for its small Drive Helper in `%LOCALAPPDATA%\AllBoot\DriveHelper\AllBootDriveHelper.ps1`. If it is missing, the app offers an **Install Drive Helper** action. The installer creates the per-user folder, writes the 201-byte PowerShell inventory helper, and verifies that it exists. No administrator permission is requested for ordinary USB discovery. Subsequent launches detect the helper automatically and enumerate drives through it. The helper only reads Windows disk inventory; it does not partition, format, erase, or write to storage devices. The native Rust preflight still independently rechecks the destination identity before any future write operation.
