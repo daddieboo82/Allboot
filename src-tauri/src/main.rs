@@ -240,8 +240,14 @@ fn macos_disk_is_eligible(
     is_boot: bool,
     bus_protocol: &str,
     has_stable_identity: bool,
+    size_bytes: u64,
 ) -> bool {
-    !internal && whole && !is_boot && is_usb_bus_protocol(bus_protocol) && has_stable_identity
+    !internal
+        && whole
+        && !is_boot
+        && is_usb_bus_protocol(bus_protocol)
+        && has_stable_identity
+        && size_bytes > 0
 }
 fn stable_macos_disk_identity(detail: &serde_json::Value) -> Option<String> {
     let serial = detail
@@ -392,7 +398,7 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                 Some(value) => value,
                 None => continue,
             };
-            if !macos_disk_is_eligible(internal, whole, is_boot, bus, !stable_id.is_empty()) {
+            if !macos_disk_is_eligible(internal, whole, is_boot, bus, !stable_id.is_empty(), size) {
                 continue;
             }
 
@@ -686,17 +692,11 @@ fn preflight_write(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let is_boot = actual_id == boot_disk;
-        if internal || !whole || actual_id != disk_id || is_boot {
-            return Err("Safety check blocked this disk because it is internal, a startup disk, or no longer the selected whole external disk. Nothing was written.".into());
-        }
         let bus = detail
             .get("BusProtocol")
             .or_else(|| detail.get("Protocol"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !is_usb_bus_protocol(bus) {
-            return Err("Safety check blocked this device because macOS does not identify it as USB storage. Nothing was written.".into());
-        }
         let serial = detail
             .get("SerialNumber")
             .and_then(|v| v.as_str())
@@ -704,14 +704,27 @@ fn preflight_write(
         let stable_id = stable_macos_disk_identity(&detail).ok_or_else(|| {
             "The external disk does not expose a stable hardware identity. For safety, AllBoot will not prepare this device. Nothing was written.".to_string()
         })?;
-        if expected_unique_id.trim().is_empty() || stable_id != expected_unique_id {
-            return Err("The selected external disk identity changed. Scan again and re-select it. Nothing was written.".into());
-        }
         let disk_size = detail
             .get("TotalSize")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        if actual_id != disk_id
+            || !macos_disk_is_eligible(
+                internal,
+                whole,
+                is_boot,
+                bus,
+                !stable_id.is_empty(),
+                disk_size,
+            )
+        {
+            return Err("The selected disk no longer meets AllBoot's external USB, startup-disk, identity, or capacity checks. Nothing was written.".into());
+        }
+        if expected_unique_id.trim().is_empty() || stable_id != expected_unique_id {
+            return Err("The selected external disk identity changed. Scan again and re-select it. Nothing was written.".into());
+        }
         let image = inspect_image(image_path)?;
+
         if !image.sha256.eq_ignore_ascii_case(expected_sha256.trim()) {
             return Err("The selected image changed after inspection. Re-select the image and run preflight again. Nothing was written.".into());
         }
@@ -831,18 +844,30 @@ mod tests {
     }
     #[test]
     fn macos_disk_eligibility_requires_every_safety_condition() {
-        assert!(macos_disk_is_eligible(false, true, false, "USB", true));
-        assert!(!macos_disk_is_eligible(true, true, false, "USB", true));
-        assert!(!macos_disk_is_eligible(false, false, false, "USB", true));
-        assert!(!macos_disk_is_eligible(false, true, true, "USB", true));
+        assert!(macos_disk_is_eligible(
+            false, true, false, "USB", true, 1024
+        ));
+        assert!(!macos_disk_is_eligible(
+            true, true, false, "USB", true, 1024
+        ));
+        assert!(!macos_disk_is_eligible(
+            false, false, false, "USB", true, 1024
+        ));
+        assert!(!macos_disk_is_eligible(
+            false, true, true, "USB", true, 1024
+        ));
         assert!(!macos_disk_is_eligible(
             false,
             true,
             false,
             "Thunderbolt",
-            true
+            true,
+            1024
         ));
-        assert!(!macos_disk_is_eligible(false, true, false, "USB", false));
+        assert!(!macos_disk_is_eligible(
+            false, true, false, "USB", false, 1024
+        ));
+        assert!(!macos_disk_is_eligible(false, true, false, "USB", true, 0));
     }
     #[test]
     fn macos_drive_filter_accepts_only_usb_bus_protocol() {
