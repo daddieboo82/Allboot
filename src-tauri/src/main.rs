@@ -1281,6 +1281,49 @@ mod tests {
             );
         }
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_drive_helper_is_versioned_and_discovery_only() {
+        let helper = drive_helper_source();
+        assert!(helper.contains("# ALLBOOT_DRIVE_HELPER_VERSION=1"));
+        assert!(helper.contains("Get-Disk"));
+        assert!(helper.contains("ConvertTo-Json"));
+        for forbidden in [
+            "Clear-Disk",
+            "Format-Volume",
+            "Initialize-Disk",
+            "Remove-Partition",
+            "Set-Disk",
+            "Remove-Item",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "discovery helper must not contain {forbidden}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_drive_helper_is_versioned_and_discovery_only() {
+        let helper = drive_helper_source();
+        assert!(helper.contains("# ALLBOOT_DRIVE_HELPER_VERSION=1"));
+        assert!(helper.contains("diskutil list -plist external physical"));
+        assert!(helper.contains("diskutil info -plist"));
+        for forbidden in [
+            "diskutil eraseDisk",
+            "diskutil partitionDisk",
+            "diskutil apfs deleteContainer",
+            "diskutil unmountDisk",
+            "diskutil eject",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "discovery helper must not contain {forbidden}"
+            );
+        }
+    }
 }
 
 fn main() {
