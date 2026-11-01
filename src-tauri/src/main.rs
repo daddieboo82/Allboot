@@ -119,6 +119,27 @@ fn windows_disk_is_eligible(
         && !unique_id.trim().is_empty()
         && size_bytes > 0
 }
+fn valid_el_torito_catalog(boot_record: &[u8], catalog: &[u8]) -> bool {
+    if boot_record.len() < 75 || catalog.len() < 64 {
+        return false;
+    }
+    if boot_record[0] != 0
+        || &boot_record[1..6] != b"CD001"
+        || &boot_record[7..30] != b"EL TORITO SPECIFICATION"
+    {
+        return false;
+    }
+    let validation = &catalog[..32];
+    if validation[0] != 0x01 || validation[30] != 0x55 || validation[31] != 0xaa {
+        return false;
+    }
+    let checksum = validation
+        .chunks_exact(2)
+        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .fold(0_u16, u16::wrapping_add);
+    checksum == 0 && catalog[32] == 0x88
+}
+
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
@@ -553,14 +574,36 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         false
     };
 
-    let mut boot_record = [0_u8; 39];
-    let el_torito_boot_record = if metadata.len() >= 34_855 {
+    let mut boot_record = [0_u8; 75];
+    let el_torito_boot_record = if metadata.len() >= 34_891 {
         file.seek(SeekFrom::Start(34_816))
             .map_err(|e| format!("Could not inspect ISO boot record: {e}"))?;
-        file.read_exact(&mut boot_record).is_ok()
-            && boot_record[0] == 0
-            && &boot_record[1..6] == b"CD001"
-            && &boot_record[7..30] == b"EL TORITO SPECIFICATION"
+        if file.read_exact(&mut boot_record).is_err()
+            || boot_record[0] != 0
+            || &boot_record[1..6] != b"CD001"
+            || &boot_record[7..30] != b"EL TORITO SPECIFICATION"
+        {
+            false
+        } else {
+            let catalog_lba = u32::from_le_bytes([
+                boot_record[71],
+                boot_record[72],
+                boot_record[73],
+                boot_record[74],
+            ]) as u64;
+            let catalog_offset = catalog_lba.saturating_mul(2048);
+            let mut catalog = [0_u8; 64];
+            if catalog_offset
+                .checked_add(64)
+                .is_some_and(|end| end <= metadata.len())
+                && file.seek(SeekFrom::Start(catalog_offset)).is_ok()
+                && file.read_exact(&mut catalog).is_ok()
+            {
+                valid_el_torito_catalog(&boot_record, &catalog)
+            } else {
+                false
+            }
+        }
     } else {
         false
     };
@@ -874,6 +917,34 @@ mod tests {
     };
 
     #[test]
+    fn validates_el_torito_catalog_checksum_signature_and_boot_entry() {
+        let mut boot_record = [0_u8; 75];
+        boot_record[0] = 0;
+        boot_record[1..6].copy_from_slice(b"CD001");
+        boot_record[7..30].copy_from_slice(b"EL TORITO SPECIFICATION");
+        let mut catalog = [0_u8; 64];
+        catalog[0] = 1;
+        catalog[30] = 0x55;
+        catalog[31] = 0xaa;
+        catalog[32] = 0x88;
+        let sum = catalog[..32]
+            .chunks_exact(2)
+            .map(|word| u16::from_le_bytes([word[0], word[1]]))
+            .fold(0_u16, u16::wrapping_add);
+        catalog[28..30].copy_from_slice(&sum.wrapping_neg().to_le_bytes());
+        assert!(valid_el_torito_catalog(&boot_record, &catalog));
+        catalog[31] = 0;
+        assert!(!valid_el_torito_catalog(&boot_record, &catalog));
+        catalog[31] = 0xaa;
+        catalog[32] = 0;
+        assert!(!valid_el_torito_catalog(&boot_record, &catalog));
+        catalog[32] = 0x88;
+        catalog[28] ^= 1;
+        assert!(!valid_el_torito_catalog(&boot_record, &catalog));
+        assert!(!valid_el_torito_catalog(&boot_record[..30], &catalog));
+    }
+
+    #[test]
     fn write_readiness_never_confuses_preflight_with_write_support() {
         assert!(image_write_readiness("iso", true, false).starts_with("Candidate only"));
         assert!(image_write_readiness("iso", false, false).contains("no El Torito"));
@@ -1068,12 +1139,24 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let mut bytes = vec![0_u8; 34_855];
+        let mut bytes = vec![0_u8; 20 * 2048 + 64];
         bytes[32_768] = 1;
         bytes[32_769..32_774].copy_from_slice(b"CD001");
         bytes[34_816] = 0;
         bytes[34_817..34_822].copy_from_slice(b"CD001");
         bytes[34_823..34_846].copy_from_slice(b"EL TORITO SPECIFICATION");
+        bytes[34_887..34_891].copy_from_slice(&20_u32.to_le_bytes());
+        let mut catalog = [0_u8; 64];
+        catalog[0] = 1;
+        catalog[30] = 0x55;
+        catalog[31] = 0xaa;
+        catalog[32] = 0x88;
+        let sum = catalog[..32]
+            .chunks_exact(2)
+            .map(|word| u16::from_le_bytes([word[0], word[1]]))
+            .fold(0_u16, u16::wrapping_add);
+        catalog[28..30].copy_from_slice(&sum.wrapping_neg().to_le_bytes());
+        bytes[20 * 2048..20 * 2048 + 64].copy_from_slice(&catalog);
         fs::write(&path, &bytes).unwrap();
         let result = inspect_image(path.to_string_lossy().to_string()).unwrap();
         assert!(result.iso9660_signature);
