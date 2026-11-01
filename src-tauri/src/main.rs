@@ -844,6 +844,43 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
+fn raw_device_path(disk_number: u32) -> Result<String, String> {
+    if disk_number == 0 {
+        return Err("Disk zero is blocked from raw-device access by AllBoot safety policy.".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(format!(r"\.\PhysicalDrive{disk_number}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(format!("/dev/rdisk{disk_number}"));
+    }
+    #[cfg(all(test, not(any(target_os = "windows", target_os = "macos"))))]
+    {
+        Err("Raw physical-device access is supported only on Windows and macOS.".into())
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)] // Activated only by the future, separately confirmed physical-write command.
+fn open_raw_device_exclusive(disk_number: u32) -> Result<File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let path = raw_device_path(disk_number)?;
+    std::fs::OpenOptions::new().read(true).write(true).share_mode(0).custom_flags(0x8000_0000).open(&path)
+        .map_err(|e| format!("Could not open {path} exclusively. Close applications using the USB drive and ensure AllBoot has the required permissions: {e}"))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // Activated only by the future, separately confirmed physical-write command.
+fn open_raw_device_exclusive(disk_number: u32) -> Result<File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = raw_device_path(disk_number)?;
+    std::fs::OpenOptions::new().read(true).write(true).custom_flags(0x880).open(&path)
+        .map_err(|e| format!("Could not open {path} exclusively. Unmount the external disk and grant AllBoot the required permissions: {e}"))
+}
+
 #[tauri::command]
 fn inspect_image(path: String) -> Result<ImageInspection, String> {
     let image_path = Path::new(&path);
@@ -1910,6 +1947,23 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
+    #[test]
+    fn raw_device_path_rejects_disk_zero() {
+        assert!(raw_device_path(0).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_raw_device_path_uses_physical_drive_namespace() {
+        assert_eq!(raw_device_path(12).unwrap(), r"\.\PhysicalDrive12");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_raw_device_path_uses_raw_whole_disk_namespace() {
+        assert_eq!(raw_device_path(12).unwrap(), "/dev/rdisk12");
+    }
+
     #[test]
     fn windows_drive_helper_passes_powershell_parser() {
         let path =
