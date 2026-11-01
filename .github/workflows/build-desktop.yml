@@ -46,6 +46,13 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci --no-audit --no-fund
 
+      - name: Check Rust formatting
+        working-directory: src-tauri
+        run: cargo fmt -- --check
+
+      - name: Build frontend production bundle
+        run: npm run build
+
       - name: Run native tests
         working-directory: src-tauri
         run: cargo test --locked --verbose

@@ -1598,6 +1598,50 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    fn windows_drive_helper_passes_powershell_parser() {
+        let path =
+            std::env::temp_dir().join(format!("allboot-helper-{}-test.ps1", std::process::id()));
+        std::fs::write(&path, WINDOWS_DRIVE_HELPER_SOURCE).expect("write temporary helper");
+        let parse = "$tokens=$null; $errors=$null; [System.Management.Automation.Language.Parser]::ParseFile($env:ALLBOOT_TEST_HELPER,[ref]$tokens,[ref]$errors) > $null; if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }";
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                parse,
+            ])
+            .env("ALLBOOT_TEST_HELPER", &path)
+            .output()
+            .expect("PowerShell parser should be available on Windows CI");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            output.status.success(),
+            "PowerShell helper syntax error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_drive_helper_passes_posix_shell_parser() {
+        let path =
+            std::env::temp_dir().join(format!("allboot-helper-{}-test.sh", std::process::id()));
+        std::fs::write(&path, MACOS_DRIVE_HELPER_SOURCE).expect("write temporary helper");
+        let output = Command::new("/bin/sh")
+            .args(["-n", path.to_str().expect("temporary path is UTF-8")])
+            .output()
+            .expect("POSIX shell parser should be available on macOS CI");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            output.status.success(),
+            "macOS helper syntax error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
     fn windows_drive_helper_is_versioned_and_discovery_only() {
         let helper = drive_helper_source();
         assert!(helper.contains("# ALLBOOT_DRIVE_HELPER_VERSION=1"));
