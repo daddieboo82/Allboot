@@ -532,28 +532,85 @@ fn install_drive_helper() -> Result<String, String> {
     std::fs::create_dir_all(folder)
         .map_err(|e| format!("Could not create the AllBoot helper folder: {e}"))?;
 
-    #[cfg(target_os = "windows")]
-    {
-        let script = drive_helper_source();
-        std::fs::write(&path, script)
-            .map_err(|e| format!("Could not install the Windows drive helper: {e}"))?;
+    let source = drive_helper_source();
+    if source.is_empty() {
+        return Err("AllBoot Drive Helper currently supports Windows and macOS.".into());
     }
+    if std::fs::read_to_string(&path)
+        .map(|contents| helper_version_supported(&contents))
+        .unwrap_or(false)
+    {
+        return Ok(path.to_string_lossy().to_string());
+    }
+
+    let temporary = path.with_extension(format!("install-{}.tmp", std::process::id()));
+    let backup = path.with_extension(format!("backup-{}", std::process::id()));
+    let mut staged = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|e| format!("Could not create a staged helper installer file: {e}"))?;
+    use std::io::Write as _;
+    staged
+        .write_all(source.as_bytes())
+        .and_then(|_| staged.sync_all())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("Could not write the staged drive helper: {e}")
+        })?;
+    drop(staged);
+
     #[cfg(target_os = "macos")]
     {
-        let script = drive_helper_source();
-        std::fs::write(&path, script)
-            .map_err(|e| format!("Could not install the macOS drive helper: {e}"))?;
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("Could not make the macOS helper executable: {e}"))?;
+        if let Err(error) =
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))
+        {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("Could not secure the staged macOS helper: {error}"));
+        }
     }
+
+    let staged_contents = std::fs::read_to_string(&temporary)
+        .map_err(|e| format!("Could not verify the staged helper: {e}"))?;
+    if !helper_version_supported(&staged_contents) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err("The staged helper failed its exact source and version check.".into());
+    }
+
+    let had_previous = path.exists();
+    if had_previous {
+        if backup.exists() {
+            let _ = std::fs::remove_file(&temporary);
+            return Err("A previous helper-install recovery file already exists. Resolve it before reinstalling.".into());
+        }
+        std::fs::rename(&path, &backup).map_err(|e| {
+            let _ = std::fs::remove_file(&temporary);
+            format!("Could not safely stage the previous helper for replacement: {e}")
+        })?;
+    }
+
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        if had_previous {
+            let _ = std::fs::rename(&backup, &path);
+        }
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("Could not activate the verified helper. The previous helper was restored when possible: {error}"));
+    }
+
     let installed_contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("Could not verify the installed helper contents: {e}"))?;
-    if !helper_version_supported(&installed_contents) {
-        return Err("The installed drive helper failed its version check.".into());
+    if !helper_version_supported(&installed_contents) || !path.is_file() {
+        let _ = std::fs::remove_file(&path);
+        if had_previous {
+            let _ = std::fs::rename(&backup, &path);
+        }
+        return Err("The activated helper failed verification. The previous helper was restored when possible.".into());
     }
-    if !path.is_file() {
-        return Err("The helper could not be verified after installation.".into());
+
+    if had_previous {
+        std::fs::remove_file(&backup)
+            .map_err(|e| format!("The new helper is installed and verified, but the old recovery copy could not be removed: {e}"))?;
     }
     Ok(path.to_string_lossy().to_string())
 }
