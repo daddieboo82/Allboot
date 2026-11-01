@@ -165,6 +165,28 @@ fn parent_disk_identifier(volume_id: &str) -> Option<String> {
     }
     Some(format!("disk{}", digits))
 }
+#[cfg(any(target_os = "macos", test))]
+fn stable_macos_disk_identity(detail: &serde_json::Value) -> Option<String> {
+    let serial = detail
+        .get("SerialNumber")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let media_uuid = detail
+        .get("MediaUUID")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let device_tree = detail
+        .get("DeviceTreePath")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if serial.is_empty() && media_uuid.is_empty() && device_tree.is_empty() {
+        return None;
+    }
+    Some(format!("{}|{}|{}", serial, media_uuid, device_tree))
+}
 #[tauri::command]
 fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
     #[cfg(target_os = "windows")]
@@ -285,6 +307,10 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("External storage device")
                 .to_string();
+            let stable_id = match stable_macos_disk_identity(&detail) {
+                Some(value) => value,
+                None => continue,
+            };
             let serial = detail
                 .get("SerialNumber")
                 .and_then(|v| v.as_str())
@@ -296,18 +322,7 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
                 bus_type: bus.to_string(),
                 size_bytes: size,
                 serial_number: serial.clone(),
-                unique_id: format!(
-                    "{}|{}|{}",
-                    serial,
-                    detail
-                        .get("MediaUUID")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(""),
-                    detail
-                        .get("DeviceTreePath")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(actual_id)
-                ),
+                unique_id: stable_id,
                 partition_style: detail
                     .get("PartitionMapPartition")
                     .and_then(|v| v.as_str())
@@ -560,18 +575,9 @@ fn preflight_write(
             .get("SerialNumber")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let stable_id = format!(
-            "{}|{}|{}",
-            serial,
-            detail
-                .get("MediaUUID")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            detail
-                .get("DeviceTreePath")
-                .and_then(|v| v.as_str())
-                .unwrap_or(actual_id)
-        );
+        let stable_id = stable_macos_disk_identity(&detail).ok_or_else(|| {
+            "The external disk does not expose a stable hardware identity. For safety, AllBoot will not prepare this device. Nothing was written.".to_string()
+        })?;
         if expected_unique_id.trim().is_empty() || stable_id != expected_unique_id {
             return Err("The selected external disk identity changed. Scan again and re-select it. Nothing was written.".into());
         }
@@ -633,6 +639,35 @@ mod tests {
         assert_eq!(parent_disk_identifier("disk3abc"), None);
     }
 
+    #[test]
+    fn macos_disk_identity_requires_a_hardware_or_device_tree_identifier() {
+        let empty = serde_json::json!({
+            "SerialNumber": "",
+            "MediaUUID": "",
+            "DeviceTreePath": ""
+        });
+        assert_eq!(stable_macos_disk_identity(&empty), None);
+
+        let media_uuid = serde_json::json!({
+            "SerialNumber": "",
+            "MediaUUID": "A1B2-C3D4",
+            "DeviceTreePath": ""
+        });
+        assert_eq!(
+            stable_macos_disk_identity(&media_uuid),
+            Some("|A1B2-C3D4|".into())
+        );
+
+        let serial_and_path = serde_json::json!({
+            "SerialNumber": "USB-SERIAL-123",
+            "MediaUUID": "",
+            "DeviceTreePath": "IODeviceTree:/pci/usb"
+        });
+        assert_eq!(
+            stable_macos_disk_identity(&serial_and_path),
+            Some("USB-SERIAL-123||IODeviceTree:/pci/usb".into())
+        );
+    }
     #[test]
     fn detects_iso9660_and_el_torito_and_hashes_source() {
         let path = std::env::temp_dir().join(format!(
