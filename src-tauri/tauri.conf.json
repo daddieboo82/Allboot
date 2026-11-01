@@ -26,7 +26,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
+    "icon": ["icons/icon.ico", "icons/icon.png", "icons/icon.icns"],
     "category": "Utility",
     "shortDescription": "Guided bootable USB creation",
     "longDescription": "Prepare and inspect bootable media with device identity checks and verification."

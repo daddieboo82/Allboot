@@ -32,10 +32,23 @@ struct PreflightReport {
     confirmation_phrase: String, checks: Vec<String>,
 }
 
+#[cfg(target_os = "windows")]
 fn drive_helper_path() -> Result<std::path::PathBuf, String> {
     let local = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| "Windows local application-data folder is unavailable.".to_string())?;
     Ok(std::path::PathBuf::from(local).join("AllBoot").join("DriveHelper").join("AllBootDriveHelper.ps1"))
+}
+
+#[cfg(target_os = "macos")]
+fn drive_helper_path() -> Result<std::path::PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| "macOS home folder is unavailable.".to_string())?;
+    Ok(std::path::PathBuf::from(home).join("Library").join("Application Support").join("AllBoot").join("DriveHelper").join("AllBootDriveHelper.sh"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn drive_helper_path() -> Result<std::path::PathBuf, String> {
+    Err("AllBoot Drive Helper currently supports Windows and macOS.".into())
 }
 
 #[tauri::command]
@@ -45,18 +58,45 @@ fn drive_helper_installed() -> bool {
 
 #[tauri::command]
 fn install_drive_helper() -> Result<String, String> {
+    let path = drive_helper_path()?;
+    let folder = path.parent().ok_or_else(|| "Could not determine helper installation folder.".to_string())?;
+    std::fs::create_dir_all(folder).map_err(|e| format!("Could not create the AllBoot helper folder: {e}"))?;
+
     #[cfg(target_os = "windows")]
     {
-        let path = drive_helper_path()?;
-        let folder = path.parent().ok_or_else(|| "Could not determine helper installation folder.".to_string())?;
-        std::fs::create_dir_all(folder).map_err(|e| format!("Could not create the AllBoot helper folder: {e}"))?;
         let script = "$ErrorActionPreference = 'Stop'; $disks = @(Get-Disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem); ConvertTo-Json -InputObject $disks -Compress";
-        std::fs::write(&path, script).map_err(|e| format!("Could not install the drive detection helper: {e}"))?;
-        if !path.is_file() { return Err("The helper could not be verified after installation.".into()); }
-        Ok(path.to_string_lossy().to_string())
+        std::fs::write(&path, script).map_err(|e| format!("Could not install the Windows drive helper: {e}"))?;
     }
-    #[cfg(not(target_os = "windows"))]
-    { Err("The Windows drive helper is not available on this operating system.".into()) }
+    #[cfg(target_os = "macos")]
+    {
+        let script = r#"#!/bin/sh
+set -eu
+action="$1"
+case "$action" in
+  list)
+    /usr/sbin/diskutil list -plist external physical | /usr/bin/plutil -convert json -o - -
+    ;;
+  info)
+    disk="$2"
+    case "$disk" in disk[0-9]*) ;; *) echo "Invalid disk identifier" >&2; exit 2 ;; esac
+    /usr/sbin/diskutil info -plist "/dev/$disk" | /usr/bin/plutil -convert json -o - -
+    ;;
+  boot)
+    /usr/sbin/diskutil info -plist / | /usr/bin/plutil -convert json -o - -
+    ;;
+  *)
+    echo "Supported actions: list, info, boot" >&2
+    exit 2
+    ;;
+esac
+"#;
+        std::fs::write(&path, script).map_err(|e| format!("Could not install the macOS drive helper: {e}"))?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Could not make the macOS helper executable: {e}"))?;
+    }
+    if !path.is_file() { return Err("The helper could not be verified after installation.".into()); }
+    Ok(path.to_string_lossy().to_string())
 }
 #[tauri::command]
 fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
@@ -88,8 +128,47 @@ fn list_destination_drives() -> Result<Vec<DestinationDrive>, String> {
         }
         Ok(result)
     }
-    #[cfg(not(target_os = "windows"))]
-    { Err("Windows USB discovery is not available on this operating system yet.".into()) }
+    #[cfg(target_os = "macos")]
+    {
+        let helper = drive_helper_path()?;
+        let run = |args: &[&str]| -> Result<serde_json::Value, String> {
+            let output = Command::new("sh").arg(&helper).args(args).output()
+                .map_err(|e| format!("Could not run AllBoot Drive Helper: {e}"))?;
+            if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()); }
+            serde_json::from_slice(&output.stdout).map_err(|e| format!("Could not parse macOS disk information: {e}"))
+        };
+        let inventory = run(&["list"])?;
+        let boot_info = run(&["boot"]).unwrap_or(serde_json::Value::Null);
+        let boot_volume = boot_info.get("DeviceIdentifier").and_then(|v| v.as_str()).unwrap_or("");
+        let boot_disk = boot_volume.split('s').next().unwrap_or(boot_volume);
+        let disks = inventory.get("AllDisksAndPartitions").and_then(|v| v.as_array())
+            .ok_or_else(|| "macOS returned no external physical disk list.".to_string())?;
+        let mut result = Vec::new();
+        for entry in disks {
+            let identifier = match entry.get("DeviceIdentifier").and_then(|v| v.as_str()) { Some(v) => v, None => continue };
+            if !identifier.starts_with("disk") || !identifier[4..].chars().all(|c| c.is_ascii_digit()) { continue; }
+            let detail = match run(&["info", identifier]) { Ok(v) => v, Err(_) => continue };
+            let internal = detail.get("Internal").and_then(|v| v.as_bool()).unwrap_or(true);
+            let whole = detail.get("Whole").and_then(|v| v.as_bool()).unwrap_or(false);
+            let actual_id = detail.get("DeviceIdentifier").and_then(|v| v.as_str()).unwrap_or(identifier);
+            let is_boot = actual_id == boot_disk;
+            if internal || !whole { continue; }
+            let bus = detail.get("BusProtocol").or_else(|| detail.get("Protocol")).and_then(|v| v.as_str()).unwrap_or("External");
+            let size = detail.get("TotalSize").and_then(|v| v.as_u64()).unwrap_or(0);
+            let number = identifier[4..].parse::<u32>().unwrap_or(0);
+            let name = detail.get("MediaName").and_then(|v| v.as_str()).unwrap_or("External storage device").to_string();
+            let serial = detail.get("SerialNumber").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            result.push(DestinationDrive {
+                disk_number: number, name, bus_type: bus.to_string(), size_bytes: size,
+                serial_number: serial.clone(), unique_id: format!("{}|{}|{}", serial, detail.get("MediaUUID").and_then(|v| v.as_str()).unwrap_or(""), detail.get("DeviceTreePath").and_then(|v| v.as_str()).unwrap_or(actual_id)),
+                partition_style: detail.get("PartitionMapPartition").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
+                is_boot, is_system: is_boot,
+            });
+        }
+        Ok(result)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    { Err("AllBoot drive discovery supports Windows and macOS.".into()) }
 }
 
 #[tauri::command]
@@ -206,10 +285,58 @@ fn preflight_write(disk_number: u32, expected_unique_id: String, image_path: Str
             ],
         })
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        let helper = drive_helper_path()?;
+        let disk_id = format!("disk{}", disk_number);
+        let run_info = |action: &str, id: Option<&str>| -> Result<serde_json::Value, String> {
+            let mut command = Command::new("sh");
+            command.arg(&helper).arg(action);
+            if let Some(value) = id { command.arg(value); }
+            let output = command.output().map_err(|e| format!("Could not re-check macOS disk: {e}"))?;
+            if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_string()); }
+            serde_json::from_slice(&output.stdout).map_err(|e| format!("Could not parse macOS disk identity: {e}"))
+        };
+        let detail = run_info("info", Some(&disk_id))?;
+        let boot = run_info("boot", None).unwrap_or(serde_json::Value::Null);
+        let boot_volume = boot.get("DeviceIdentifier").and_then(|v| v.as_str()).unwrap_or("");
+        let boot_disk = boot_volume.split('s').next().unwrap_or(boot_volume);
+        let actual_id = detail.get("DeviceIdentifier").and_then(|v| v.as_str()).unwrap_or("");
+        let internal = detail.get("Internal").and_then(|v| v.as_bool()).unwrap_or(true);
+        let whole = detail.get("Whole").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_boot = actual_id == boot_disk;
+        if internal || !whole || actual_id != disk_id || is_boot {
+            return Err("Safety check blocked this disk because it is internal, a startup disk, or no longer the selected whole external disk. Nothing was written.".into());
+        }
+        let bus = detail.get("BusProtocol").or_else(|| detail.get("Protocol")).and_then(|v| v.as_str()).unwrap_or("External");
+        let serial = detail.get("SerialNumber").and_then(|v| v.as_str()).unwrap_or("");
+        let stable_id = format!("{}|{}|{}", serial, detail.get("MediaUUID").and_then(|v| v.as_str()).unwrap_or(""), detail.get("DeviceTreePath").and_then(|v| v.as_str()).unwrap_or(actual_id));
+        if expected_unique_id.trim().is_empty() || stable_id != expected_unique_id {
+            return Err("The selected external disk identity changed. Scan again and re-select it. Nothing was written.".into());
+        }
+        let disk_size = detail.get("TotalSize").and_then(|v| v.as_u64()).unwrap_or(0);
+        let image = inspect_image(image_path)?;
+        if image.size_bytes > disk_size {
+            return Err(format!("The image is larger than the selected external disk ({} bytes available, {} bytes required). Nothing was written.", disk_size, image.size_bytes));
+        }
+        Ok(PreflightReport {
+            disk_number, drive_name: detail.get("MediaName").and_then(|v| v.as_str()).unwrap_or("External storage device").to_string(),
+            disk_size_bytes: disk_size, image_name: image.name, image_size_bytes: image.size_bytes,
+            image_sha256: image.sha256, confirmation_phrase: format!("ERASE DISK {}", disk_number),
+            checks: vec![
+                "External physical disk re-queried immediately before preparation".into(),
+                format!("External connection protocol confirmed: {}", bus),
+                "Internal and current startup disks excluded".into(),
+                "Stable device identity matched the selected disk".into(),
+                "Image exists and SHA-256 was recalculated".into(),
+                "Image size fits within the selected external disk".into(),
+            ],
+        })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = (disk_number, expected_unique_id, image_path);
-        Err("This preflight implementation currently supports Windows only.".into())
+        Err("AllBoot preflight supports Windows and macOS.".into())
     }
 }
 
@@ -279,6 +406,22 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_helper_installs_and_returns_read_only_external_disk_inventory() {
+        let installed_path = install_drive_helper().expect("macOS helper should install");
+        let helper = std::path::Path::new(&installed_path);
+        assert!(helper.is_file());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(helper).unwrap().permissions().mode() & 0o777, 0o700);
+        let output = Command::new("sh").arg(helper).arg("list").output().expect("helper should execute");
+        assert!(output.status.success(), "helper list action should succeed");
+        let _: serde_json::Value = serde_json::from_slice(&output.stdout).expect("diskutil plist JSON should parse");
+        let drives = list_destination_drives().expect("macOS external disk discovery should succeed");
+        for drive in drives {
+            assert!(!drive.is_boot && !drive.is_system, "startup disk must not be selectable");
+        }
+    }
 }
 
 fn main() {

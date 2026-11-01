@@ -1,0 +1,51 @@
+name: Cross-platform desktop builds
+
+on:
+  push:
+    branches: [feature/native-drive-discovery]
+  pull_request:
+    branches: [main, master, feature/native-drive-discovery]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+            artifact: windows
+          - os: macos-latest
+            platform: macOS
+            artifact: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Run native tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build native desktop installers
+        run: npm run tauri:build
+
+      - name: Upload platform installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: AllBoot-${{ matrix.artifact }}
+          path: src-tauri/target/release/bundle/**
+          if-no-files-found: error

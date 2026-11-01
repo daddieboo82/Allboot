@@ -61,3 +61,14 @@ The native Tauri commands require the Visual Studio Developer environment on Win
 ## One-time Windows Drive Helper
 
 On first launch, AllBoot checks for its small Drive Helper in `%LOCALAPPDATA%\AllBoot\DriveHelper\AllBootDriveHelper.ps1`. If it is missing, the app offers an **Install Drive Helper** action. The installer creates the per-user folder, writes the 201-byte PowerShell inventory helper, and verifies that it exists. No administrator permission is requested for ordinary USB discovery. Subsequent launches detect the helper automatically and enumerate drives through it. The helper only reads Windows disk inventory; it does not partition, format, erase, or write to storage devices. The native Rust preflight still independently rechecks the destination identity before any future write operation.
+
+## Windows and macOS Drive Helper
+
+The same AllBoot first-run setup flow installs a tiny helper tailored to the host OS:
+
+- **Windows:** %LOCALAPPDATA%\AllBoot\DriveHelper\AllBootDriveHelper.ps1. It uses built-in Windows Storage cmdlets to read disk inventory.
+- **macOS:** ~/Library/Application Support/AllBoot/DriveHelper/AllBootDriveHelper.sh. It uses Apple's built-in diskutil and plutil to list external physical disks, inspect device identity and query the startup volume.
+
+The helper is installed per user, requires no administrator privileges for read-only discovery, and does not write, erase, partition or format disks. The app independently rechecks the selected device identity and excludes internal/startup disks before any future write operation.
+
+Tauri packaging uses the host platform's default bundle targets so Windows builds produce Windows installers and macOS builds produce macOS app/DMG packages. A macOS build must be produced and tested on macOS; this Windows development machine cannot validate the macOS helper against real Apple hardware. The macOS implementation is present in the shared Rust code but requires a native macOS build and device test before being called release-ready.
