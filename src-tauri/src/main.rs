@@ -293,7 +293,7 @@ where
     destination
         .seek(SeekFrom::Start(0))
         .map_err(|e| format!("Could not rewind the destination for verification: {e}"))?;
-    verify_image_readback(destination, image_size, image_sha256)
+    verify_device_readback_prefix(destination, image_size, image_sha256)
 }
 
 fn verify_image_readback<R: Read>(
@@ -339,6 +339,52 @@ fn verify_image_readback<R: Read>(
     }
     Ok(actual)
 }
+
+fn verify_device_readback_prefix<R: Read>(
+    reader: &mut R,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<String, String> {
+    if expected_size == 0
+        || expected_sha256.trim().len() != 64
+        || !expected_sha256
+            .trim()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("The device read-back size or expected SHA-256 is invalid.".into());
+    }
+    const CHUNK_SIZE: usize = 1024 * 1024;
+    let mut buffer = vec![0_u8; CHUNK_SIZE];
+    let mut verified = 0_u64;
+    let mut hasher = Sha256::new();
+    while verified < expected_size {
+        let remaining = expected_size - verified;
+        let requested = usize::try_from(remaining.min(CHUNK_SIZE as u64))
+            .map_err(|_| "Device read-back chunk size is not representable.".to_string())?;
+        let count = reader
+            .read(&mut buffer[..requested])
+            .map_err(|e| format!("Could not read USB device for verification: {e}"))?;
+        if count == 0 {
+            return Err(format!(
+                "USB device read-back ended early: expected {expected_size}, verified {verified}."
+            ));
+        }
+        hasher.update(&buffer[..count]);
+        verified = verified
+            .checked_add(count as u64)
+            .ok_or_else(|| "USB read-back byte counter overflowed.".to_string())?;
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected_sha256.trim()) {
+        return Err(format!(
+            "USB device image-region SHA-256 mismatch: expected {}, read back {actual}.",
+            expected_sha256.trim()
+        ));
+    }
+    Ok(actual)
+}
+
 fn erase_confirmation_phrase(
     disk_number: u32,
     stable_identity: &str,
@@ -2958,13 +3004,13 @@ mod tests {
         let hash = format!("{:x}", Sha256::digest(bytes));
         let phrase = erase_confirmation_phrase(7, "USB-TEST-7", &hash);
         let mut source = std::io::Cursor::new(bytes.to_vec());
-        let mut destination = std::io::Cursor::new(vec![0_u8; bytes.len()]);
+        let mut destination = std::io::Cursor::new(vec![0_u8; bytes.len() + 4096]);
         let mut progress = Vec::new();
         let result = write_verified_stream(
             &mut source,
             &mut destination,
             bytes.len() as u64,
-            bytes.len() as u64,
+            (bytes.len() + 4096) as u64,
             7,
             "USB-TEST-7",
             &hash,
@@ -2974,7 +3020,10 @@ mod tests {
         )
         .expect("verified pipeline should complete");
         assert_eq!(result, hash);
-        assert_eq!(destination.get_ref(), bytes);
+        assert_eq!(&destination.get_ref()[..bytes.len()], bytes);
+        assert!(destination.get_ref()[bytes.len()..]
+            .iter()
+            .all(|byte| *byte == 0));
         assert!(!progress.is_empty());
         assert_eq!(progress.last().copied(), Some(bytes.len() as u64));
     }
