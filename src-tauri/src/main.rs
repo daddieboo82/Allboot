@@ -244,6 +244,23 @@ impl<R: Read> Read for HashingReader<'_, R> {
     }
 }
 
+trait DurableSync {
+    fn durable_sync(&mut self) -> std::io::Result<()>;
+}
+
+impl DurableSync for File {
+    fn durable_sync(&mut self) -> std::io::Result<()> {
+        self.flush()?;
+        self.sync_all()
+    }
+}
+
+impl DurableSync for std::io::Cursor<Vec<u8>> {
+    fn durable_sync(&mut self) -> std::io::Result<()> {
+        self.flush()
+    }
+}
+
 #[allow(dead_code)]
 fn write_verified_stream<R, D, C, P>(
     source: &mut R,
@@ -259,7 +276,7 @@ fn write_verified_stream<R, D, C, P>(
 ) -> Result<String, String>
 where
     R: Read,
-    D: Read + Write + Seek,
+    D: Read + Write + Seek + DurableSync,
     C: FnMut() -> bool,
     P: FnMut(u64),
 {
@@ -297,8 +314,8 @@ where
         return Err("The destination write did not complete the expected image length.".into());
     }
     destination
-        .flush()
-        .map_err(|e| format!("Could not flush the destination: {e}"))?;
+        .durable_sync()
+        .map_err(|e| format!("Could not durably flush the destination to the device: {e}"))?;
     destination
         .seek(SeekFrom::Start(0))
         .map_err(|e| format!("Could not rewind the destination for verification: {e}"))?;
@@ -3088,6 +3105,53 @@ mod tests {
             .all(|byte| *byte == 0));
         assert!(!progress.is_empty());
         assert_eq!(progress.last().copied(), Some(bytes.len() as u64));
+    }
+
+    #[test]
+    fn verified_write_pipeline_durably_syncs_a_regular_file_before_readback() {
+        let bytes = b"durable write verification fixture";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let phrase = erase_confirmation_phrase(13, "FILE-TEST-13", &hash);
+        let path = std::env::temp_dir().join(format!(
+            "allboot-durable-write-{}-{}.bin",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut destination = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create temporary readable and writable regular file");
+        destination
+            .set_len((bytes.len() + 4096) as u64)
+            .expect("size temporary regular file");
+        let mut source = std::io::Cursor::new(bytes.to_vec());
+        let result = write_verified_stream(
+            &mut source,
+            &mut destination,
+            bytes.len() as u64,
+            (bytes.len() + 4096) as u64,
+            13,
+            "FILE-TEST-13",
+            &hash,
+            &phrase,
+            || false,
+            |_| {},
+        )
+        .expect("durable write and read-back should succeed");
+        assert_eq!(result, hash);
+        drop(destination);
+        let mut persisted = File::open(&path).expect("reopen persisted regular file");
+        assert_eq!(
+            verify_device_readback_prefix(&mut persisted, bytes.len() as u64, &hash).unwrap(),
+            hash
+        );
+        drop(persisted);
+        std::fs::remove_file(path).expect("remove temporary regular file");
     }
 
     #[test]
