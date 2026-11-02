@@ -3036,6 +3036,47 @@ mod tests {
     }
 
     #[test]
+    fn verified_write_pipeline_rejects_zero_length_and_malformed_hash_before_writing() {
+        let bytes = b"keep destination unchanged";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let phrase = erase_confirmation_phrase(11, "USB-TEST-11", &hash);
+
+        let mut source = std::io::Cursor::new(bytes.to_vec());
+        let mut destination = std::io::Cursor::new(vec![0xA5_u8; bytes.len()]);
+        let zero_length = write_verified_stream(
+            &mut source,
+            &mut destination,
+            0,
+            bytes.len() as u64,
+            11,
+            "USB-TEST-11",
+            &hash,
+            &phrase,
+            || false,
+            |_| {},
+        )
+        .expect_err("zero-length image must be rejected");
+        assert!(zero_length.contains("insufficient or invalid"));
+        assert_eq!(destination.get_ref(), &vec![0xA5_u8; bytes.len()]);
+
+        let malformed_hash = write_verified_stream(
+            &mut source,
+            &mut destination,
+            bytes.len() as u64,
+            bytes.len() as u64,
+            11,
+            "USB-TEST-11",
+            "not-a-sha256",
+            &erase_confirmation_phrase(11, "USB-TEST-11", "not-a-sha256"),
+            || false,
+            |_| {},
+        )
+        .expect_err("malformed image hash must be rejected");
+        assert!(malformed_hash.contains("device identity or image hash is invalid"));
+        assert_eq!(destination.get_ref(), &vec![0xA5_u8; bytes.len()]);
+    }
+
+    #[test]
     fn image_stream_rejects_short_source_without_claiming_completion() {
         let mut source = std::io::Cursor::new(b"short".to_vec());
         let mut destination = std::io::Cursor::new(Vec::new());
