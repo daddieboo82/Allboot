@@ -2621,6 +2621,37 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_apple_partition_maps_without_claiming_hfs_or_bootability() {
+        let path = std::env::temp_dir().join(format!(
+            "allboot-apm-malformed-{}-test.img",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut bytes = vec![0_u8; 4096];
+        bytes[512..514].copy_from_slice(b"PM");
+        bytes[516..520].copy_from_slice(&129_u32.to_be_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(
+            inspect_apple_partitioned_hfs(&mut file, bytes.len() as u64),
+            (false, false),
+            "oversized partition maps must be rejected rather than treated as Apple partition maps"
+        );
+
+        bytes[516..520].copy_from_slice(&2_u32.to_be_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(
+            inspect_apple_partitioned_hfs(&mut file, bytes.len() as u64),
+            (true, false),
+            "truncated partition maps must not be treated as HFS boot evidence"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn real_ventura_full_image_inspection_when_fixture_path_is_supplied() {
         let Some(path) = std::env::var_os("ALLBOOT_VENTURA_ISO_FIXTURE") else {
             return;
