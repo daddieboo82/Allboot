@@ -44,8 +44,14 @@ struct ImageInspection {
     detected_format: String,
     iso9660_signature: bool,
     el_torito_boot_record: bool,
+    apple_partition_map_signature: bool,
+    hfs_plus_signature: bool,
     udif_signature: bool,
     macos_candidate: bool,
+    macos_installer_validated: bool,
+    macos_boot_architecture: String,
+    macos_boot_evidence: Vec<String>,
+    macos_supported_models: Vec<String>,
     sha256: String,
     bootability: String,
     write_compatibility: String,
@@ -441,10 +447,767 @@ fn open_verified_source_image(
 fn file_metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
+
+fn inspect_apple_partitioned_hfs(file: &mut File, image_size: u64) -> (bool, bool) {
+    if image_size < 1024 || file.seek(SeekFrom::Start(512)).is_err() {
+        return (false, false);
+    }
+    let mut entry = [0_u8; 512];
+    if file.read_exact(&mut entry).is_err() || &entry[..2] != b"PM" {
+        return (false, false);
+    }
+    let map_count = u32::from_be_bytes(entry[4..8].try_into().unwrap()) as u64;
+    if map_count == 0 || map_count > 128 {
+        return (false, false);
+    }
+    let mut has_hfs_plus = false;
+    for index in 0..map_count {
+        let Some(offset) = (index + 1).checked_mul(512) else {
+            break;
+        };
+        if offset.checked_add(512).is_none_or(|end| end > image_size)
+            || file.seek(SeekFrom::Start(offset)).is_err()
+            || file.read_exact(&mut entry).is_err()
+        {
+            break;
+        }
+        if &entry[..2] != b"PM" {
+            break;
+        }
+        let start = u32::from_be_bytes(entry[8..12].try_into().unwrap()) as u64;
+        let blocks = u32::from_be_bytes(entry[12..16].try_into().unwrap()) as u64;
+        let partition_type = String::from_utf8_lossy(&entry[48..80]);
+        if (partition_type.trim_end_matches('\0') == "Apple_HFS"
+            || partition_type.trim_end_matches('\0') == "Apple_HFSX")
+            && start > 0
+            && blocks > 0
+        {
+            let Some(partition_start) = start.checked_mul(512) else {
+                continue;
+            };
+            let Some(header_offset) = partition_start.checked_add(1024) else {
+                continue;
+            };
+            let Some(partition_end) = start.checked_add(blocks).and_then(|v| v.checked_mul(512))
+            else {
+                continue;
+            };
+            if partition_end <= image_size
+                && header_offset
+                    .checked_add(2)
+                    .is_some_and(|end| end <= partition_end)
+                && file.seek(SeekFrom::Start(header_offset)).is_ok()
+            {
+                let mut signature = [0_u8; 2];
+                if file.read_exact(&mut signature).is_ok()
+                    && (&signature == b"H+" || &signature == b"HX")
+                {
+                    has_hfs_plus = true;
+                    break;
+                }
+            }
+        }
+    }
+    (true, has_hfs_plus)
+}
+
+#[derive(Default)]
+struct MacOsBootEvidence {
+    validated: bool,
+    architecture: String,
+    checks: Vec<String>,
+    supported_models: Vec<String>,
+}
+
+#[derive(Clone)]
+struct HfsFork {
+    logical_size: u64,
+    extents: Vec<(u32, u32)>,
+}
+
+fn be_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+fn be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+fn be_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_be_bytes(
+        bytes.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+fn read_image_at(file: &mut File, offset: u64, output: &mut [u8], image_size: u64) -> bool {
+    offset
+        .checked_add(output.len() as u64)
+        .is_some_and(|end| end <= image_size)
+        && file.seek(SeekFrom::Start(offset)).is_ok()
+        && file.read_exact(output).is_ok()
+}
+fn parse_hfs_fork(header: &[u8], offset: usize) -> Option<HfsFork> {
+    let logical_size = be_u64(header, offset)?;
+    let mut extents = Vec::new();
+    for index in 0..8 {
+        let start = be_u32(header, offset + 16 + index * 8)?;
+        let blocks = be_u32(header, offset + 20 + index * 8)?;
+        if blocks > 0 {
+            extents.push((start, blocks));
+        }
+    }
+    Some(HfsFork {
+        logical_size,
+        extents,
+    })
+}
+fn btree_leaf_records(
+    file: &mut File,
+    base: u64,
+    logical_size: u64,
+    image_size: u64,
+) -> Option<Vec<Vec<u8>>> {
+    let mut descriptor = [0_u8; 14];
+    if !read_image_at(file, base, &mut descriptor, image_size) || descriptor[8] as i8 != 1 {
+        return None;
+    }
+    let mut header_record = [0_u8; 30];
+    if !read_image_at(file, base.checked_add(14)?, &mut header_record, image_size) {
+        return None;
+    }
+    let first_leaf = be_u32(&header_record, 10)? as u64;
+    let node_size = be_u16(&header_record, 18)? as usize;
+    let total_nodes = be_u32(&header_record, 22)? as u64;
+    let tree_bytes = (node_size as u64).checked_mul(total_nodes)?;
+    if node_size < 512
+        || node_size > 65_536
+        || total_nodes == 0
+        || total_nodes > 1_000_000
+        || tree_bytes > logical_size
+        || base.checked_add(tree_bytes)? > image_size
+        || first_leaf >= total_nodes
+    {
+        return None;
+    }
+    let mut records = Vec::new();
+    let mut visited = vec![false; total_nodes as usize];
+    let mut node = first_leaf;
+    for _ in 0..total_nodes {
+        if node == 0 {
+            return Some(records);
+        }
+        let slot = visited.get_mut(node as usize)?;
+        if *slot {
+            return None;
+        }
+        *slot = true;
+        let node_offset = base.checked_add(node.checked_mul(node_size as u64)?)?;
+        let mut raw = vec![0_u8; node_size];
+        if !read_image_at(file, node_offset, &mut raw, image_size) {
+            return None;
+        }
+        let forward_link = be_u32(&raw, 0)? as u64;
+        if raw[8] as i8 != -1 {
+            return None;
+        }
+        let record_count = be_u16(&raw, 10)? as usize;
+        let table_start = node_size.checked_sub(2usize.checked_mul(record_count + 1)?)?;
+        let mut offsets = Vec::with_capacity(record_count + 1);
+        for index in 0..=record_count {
+            offsets.push(be_u16(&raw, node_size.checked_sub(2 * (index + 1))?)? as usize);
+        }
+        for index in 0..record_count {
+            let start = offsets[index];
+            let end = offsets[index + 1];
+            if start < 14 || start >= end || end > table_start {
+                return None;
+            }
+            records.push(raw[start..end].to_vec());
+        }
+        node = forward_link;
+        if node >= total_nodes {
+            return None;
+        }
+    }
+    None
+}
+fn hfs_folder_path(folders: &[(u32, u32, String)], folder_id: u32) -> Option<String> {
+    if folder_id == 2 {
+        return Some(String::new());
+    }
+    let mut components = Vec::new();
+    let mut current = folder_id;
+    let mut visited = Vec::new();
+    for _ in 0..64 {
+        if current == 2 {
+            components.reverse();
+            return Some(components.join("/"));
+        }
+        if current == 1 || visited.contains(&current) {
+            return None;
+        }
+        visited.push(current);
+        let (_, parent, name) = folders.iter().find(|(id, _, _)| *id == current)?;
+        components.push(name.clone());
+        current = *parent;
+    }
+    None
+}
+fn read_hfs_fork_range(
+    file: &mut File,
+    partition_start: u64,
+    block_size: u64,
+    extents: &[(u32, u32)],
+    logical_size: u64,
+    offset: u64,
+    output: &mut [u8],
+    image_size: u64,
+) -> bool {
+    let Some(end) = offset.checked_add(output.len() as u64) else {
+        return false;
+    };
+    if end > logical_size || block_size == 0 {
+        return false;
+    }
+    let mut logical_position = offset;
+    let mut written = 0_usize;
+    while written < output.len() {
+        let logical_block = logical_position / block_size;
+        let within_block = logical_position % block_size;
+        let mut blocks_before = 0_u64;
+        let mut physical_block = None;
+        for (start, count) in extents {
+            let count = *count as u64;
+            if logical_block >= blocks_before && logical_block < blocks_before + count {
+                physical_block = Some(*start as u64 + logical_block - blocks_before);
+                break;
+            }
+            blocks_before = blocks_before.saturating_add(count);
+        }
+        let Some(physical_block) = physical_block else {
+            return false;
+        };
+        let physical_offset = partition_start
+            .checked_add(physical_block.checked_mul(block_size).unwrap_or(u64::MAX))
+            .and_then(|value| value.checked_add(within_block));
+        let Some(physical_offset) = physical_offset else {
+            return false;
+        };
+        let count = (block_size - within_block).min((output.len() - written) as u64) as usize;
+        if !read_image_at(
+            file,
+            physical_offset,
+            &mut output[written..written + count],
+            image_size,
+        ) {
+            return false;
+        }
+        written += count;
+        logical_position += count as u64;
+    }
+    true
+}
+fn hfs_fork_extents_complete(
+    file: &mut File,
+    partition_start: u64,
+    block_size: u64,
+    total_blocks: u64,
+    extents_fork: &HfsFork,
+    file_id: u32,
+    fork_type: u8,
+    initial_extents: &[(u32, u32)],
+    logical_size: u64,
+    image_size: u64,
+) -> Option<Vec<(u32, u32)>> {
+    let first_extent = extents_fork.extents.first()?;
+    let extents_base =
+        partition_start.checked_add((first_extent.0 as u64).checked_mul(block_size)?)?;
+    let records = btree_leaf_records(file, extents_base, extents_fork.logical_size, image_size)?;
+    let mut overflow = Vec::new();
+    for record in records {
+        if record.len() < 76 || record[2] != fork_type || be_u32(&record, 4)? != file_id {
+            continue;
+        }
+        let start_block = be_u32(&record, 8)?;
+        let mut extents = Vec::new();
+        for index in 0..8 {
+            let start = be_u32(&record, 12 + index * 8)?;
+            let count = be_u32(&record, 16 + index * 8)?;
+            if count > 0 {
+                extents.push((start, count));
+            }
+        }
+        overflow.push((start_block, extents));
+    }
+    overflow.sort_by_key(|(start, _)| *start);
+    let mut result = initial_extents.to_vec();
+    let mut expected_start: u64 = result.iter().map(|(_, count)| *count as u64).sum();
+    for (start, additional) in overflow {
+        if start as u64 != expected_start {
+            return None;
+        }
+        expected_start = expected_start.checked_add(
+            additional
+                .iter()
+                .map(|(_, count)| *count as u64)
+                .sum::<u64>(),
+        )?;
+        result.extend(additional);
+    }
+    if result.iter().any(|(start, count)| {
+        (*start as u64)
+            .checked_add(*count as u64)
+            .is_none_or(|end| end > total_blocks)
+    }) {
+        return None;
+    }
+    let required_blocks = logical_size.checked_add(block_size.checked_sub(1)?)? / block_size;
+    let mapped_blocks: u64 = result.iter().map(|(_, count)| *count as u64).sum();
+    if mapped_blocks < required_blocks {
+        return None;
+    }
+    Some(result)
+}
+fn hfs_fork_has_udif_trailer(
+    file: &mut File,
+    partition_start: u64,
+    block_size: u64,
+    total_blocks: u64,
+    extents_fork: &HfsFork,
+    file_id: u32,
+    fork: &HfsFork,
+    image_size: u64,
+) -> bool {
+    let Some(extents) = hfs_fork_extents_complete(
+        file,
+        partition_start,
+        block_size,
+        total_blocks,
+        extents_fork,
+        file_id,
+        0,
+        &fork.extents,
+        fork.logical_size,
+        image_size,
+    ) else {
+        return false;
+    };
+    if fork.logical_size < 512 {
+        return false;
+    }
+    let mut trailer = [0_u8; 512];
+    read_hfs_fork_range(
+        file,
+        partition_start,
+        block_size,
+        &extents,
+        fork.logical_size,
+        fork.logical_size - 512,
+        &mut trailer,
+        image_size,
+    ) && &trailer[..4] == b"koly"
+}
+
+fn hfs_pe_architecture(
+    file: &mut File,
+    partition_start: u64,
+    block_size: u64,
+    fork: &HfsFork,
+    image_size: u64,
+) -> Option<String> {
+    let mut header = [0_u8; 64];
+    if !read_hfs_fork_range(
+        file,
+        partition_start,
+        block_size,
+        &fork.extents,
+        fork.logical_size,
+        0,
+        &mut header,
+        image_size,
+    ) || &header[..2] != b"MZ"
+    {
+        return None;
+    }
+    let pe_offset = u32::from_le_bytes(header[0x3c..0x40].try_into().ok()?) as u64;
+    if pe_offset.checked_add(6)? > fork.logical_size {
+        return None;
+    }
+    let mut pe = [0_u8; 6];
+    if !read_hfs_fork_range(
+        file,
+        partition_start,
+        block_size,
+        &fork.extents,
+        fork.logical_size,
+        pe_offset,
+        &mut pe,
+        image_size,
+    ) || &pe[..4] != b"PE\0\0"
+    {
+        return None;
+    }
+    match u16::from_le_bytes(pe[4..6].try_into().ok()?) {
+        0x8664 => Some("x86_64".into()),
+        0xaa64 => Some("ARM64".into()),
+        _ => None,
+    }
+}
+fn plist_string_array(bytes: &[u8], key: &str) -> Vec<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let key_tag = format!("<key>{key}</key>");
+    let Some(after_key) = text.split_once(&key_tag).map(|(_, rest)| rest) else {
+        return Vec::new();
+    };
+    let Some(after_array) = after_key.split_once("<array>").map(|(_, rest)| rest) else {
+        return Vec::new();
+    };
+    let Some(array) = after_array
+        .split_once("</array>")
+        .map(|(content, _)| content)
+    else {
+        return Vec::new();
+    };
+    array
+        .split("<string>")
+        .skip(1)
+        .filter_map(|part| {
+            part.split_once("</string>")
+                .map(|(value, _)| value.trim().to_string())
+        })
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn inspect_macos_boot_structure(file: &mut File, image_size: u64) -> MacOsBootEvidence {
+    let mut evidence = MacOsBootEvidence::default();
+    let mut map_entry = [0_u8; 512];
+    if !read_image_at(file, 512, &mut map_entry, image_size) || &map_entry[..2] != b"PM" {
+        return evidence;
+    }
+    let map_count = match be_u32(&map_entry, 4) {
+        Some(value) if value > 0 && value <= 128 => value as u64,
+        _ => return evidence,
+    };
+    for index in 0..map_count {
+        let Some(map_offset) = (index + 1).checked_mul(512) else {
+            return evidence;
+        };
+        if !read_image_at(file, map_offset, &mut map_entry, image_size) || &map_entry[..2] != b"PM"
+        {
+            return evidence;
+        }
+        let start = match be_u32(&map_entry, 8) {
+            Some(value) => value as u64,
+            None => continue,
+        };
+        let blocks = match be_u32(&map_entry, 12) {
+            Some(value) => value as u64,
+            None => continue,
+        };
+        let partition_type = String::from_utf8_lossy(&map_entry[48..80]);
+        if !matches!(
+            partition_type.trim_end_matches('\0'),
+            "Apple_HFS" | "Apple_HFSX"
+        ) || start == 0
+            || blocks == 0
+        {
+            continue;
+        }
+        let Some(partition_start) = start.checked_mul(512) else {
+            continue;
+        };
+        let Some(partition_bytes) = blocks.checked_mul(512) else {
+            continue;
+        };
+        let Some(partition_end) = partition_start.checked_add(partition_bytes) else {
+            continue;
+        };
+        if partition_end > image_size {
+            continue;
+        }
+        let mut volume_header = [0_u8; 512];
+        if !read_image_at(
+            file,
+            partition_start.saturating_add(1024),
+            &mut volume_header,
+            image_size,
+        ) || !matches!(&volume_header[..2], b"H+" | b"HX")
+        {
+            continue;
+        }
+        let Some(block_size) = be_u32(&volume_header, 40).map(|value| value as u64) else {
+            continue;
+        };
+        let Some(total_blocks) = be_u32(&volume_header, 44).map(|value| value as u64) else {
+            continue;
+        };
+        if block_size < 512
+            || block_size > 65_536
+            || !block_size.is_power_of_two()
+            || total_blocks == 0
+            || total_blocks
+                .checked_mul(block_size)
+                .is_none_or(|bytes| bytes > partition_bytes)
+        {
+            continue;
+        }
+        let blessed_folder_id = be_u32(&volume_header, 80).unwrap_or(0);
+        let Some(extents_fork) = parse_hfs_fork(&volume_header, 192) else {
+            continue;
+        };
+        let Some(catalog_fork) = parse_hfs_fork(&volume_header, 272) else {
+            continue;
+        };
+        let Some(catalog_first) = catalog_fork.extents.first() else {
+            continue;
+        };
+        let Some(catalog_base) =
+            partition_start.checked_add((catalog_first.0 as u64).saturating_mul(block_size))
+        else {
+            continue;
+        };
+        let Some(catalog_records) =
+            btree_leaf_records(file, catalog_base, catalog_fork.logical_size, image_size)
+        else {
+            continue;
+        };
+        let mut folders: Vec<(u32, u32, String)> = Vec::new();
+        let mut files: Vec<(u32, String, u32, HfsFork)> = Vec::new();
+        for record in catalog_records {
+            if record.len() < 10 {
+                continue;
+            }
+            let Some(key_length) = be_u16(&record, 0).map(|value| value as usize) else {
+                continue;
+            };
+            let key_end = 2usize.saturating_add(key_length);
+            let Some(name_length) = be_u16(&record, 6).map(|value| value as usize) else {
+                continue;
+            };
+            let name_end = 8usize.saturating_add(name_length.saturating_mul(2));
+            if key_end != name_end || name_end.saturating_add(2) > record.len() {
+                continue;
+            }
+            let Some(parent_id) = be_u32(&record, 2) else {
+                continue;
+            };
+            let name_units: Vec<u16> = record[8..name_end]
+                .chunks_exact(2)
+                .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+                .collect();
+            let name = String::from_utf16(&name_units).unwrap_or_default();
+            let Some(record_type) = be_u16(&record, name_end) else {
+                continue;
+            };
+            match record_type {
+                1 if record.len() >= name_end + 12 => {
+                    if let Some(folder_id) = be_u32(&record, name_end + 8) {
+                        folders.push((folder_id, parent_id, name));
+                    }
+                }
+                2 if record.len() >= name_end + 168 => {
+                    let Some(file_id) = be_u32(&record, name_end + 8) else {
+                        continue;
+                    };
+                    let Some(fork) = parse_hfs_fork(&record, name_end + 88) else {
+                        continue;
+                    };
+                    files.push((parent_id, name, file_id, fork));
+                }
+                _ => {}
+            }
+        }
+        let folder_path = |folder_id: u32| hfs_folder_path(&folders, folder_id);
+        let blessed_path = folder_path(blessed_folder_id);
+        let blessed_core_services = blessed_path
+            .as_deref()
+            .is_some_and(|path| path == "System/Library/CoreServices");
+        let installer_bundle = folders.iter().any(|(id, parent, name)| {
+            *parent == 2
+                && name == "Install macOS Ventura.app"
+                && folder_path(*id).as_deref() == Some("Install macOS Ventura.app")
+        });
+        let mut boot_architecture = None;
+        let mut platform_support = false;
+        let mut platform_models = Vec::new();
+        let mut base_system = false;
+        let mut base_system_id = None;
+        let mut base_system_fork = None;
+        let mut base_system_udif = false;
+        let mut shared_support = false;
+        let mut shared_support_udif = false;
+        let mut shared_support_id = None;
+        let mut shared_support_fork = None;
+        for (parent, name, file_id, fork) in &files {
+            let Some(parent_path) = folder_path(*parent) else {
+                continue;
+            };
+            let path = if parent_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent_path}/{name}")
+            };
+            match path.as_str() {
+                "System/Library/CoreServices/boot.efi" if blessed_core_services => {
+                    boot_architecture =
+                        hfs_pe_architecture(file, partition_start, block_size, fork, image_size);
+                }
+                "System/Library/CoreServices/PlatformSupport.plist" => {
+                    let read_length = fork.logical_size.min(16_384) as usize;
+                    let mut plist = vec![0_u8; read_length];
+                    let read_ok = read_length > 0
+                        && read_hfs_fork_range(
+                            file,
+                            partition_start,
+                            block_size,
+                            &fork.extents,
+                            fork.logical_size,
+                            0,
+                            &mut plist,
+                            image_size,
+                        );
+                    if read_ok {
+                        platform_models = plist_string_array(&plist, "SupportedModelProperties");
+                        platform_support = plist
+                            .windows(b"SupportedBoardIds".len())
+                            .any(|w| w == b"SupportedBoardIds")
+                            && !platform_models.is_empty();
+                    }
+                }
+                "BaseSystem/BaseSystem.dmg" => {
+                    base_system = fork.logical_size > 0;
+                    base_system_id = Some(*file_id);
+                    base_system_fork = Some(fork.clone());
+                }
+                "Install macOS Ventura.app/Contents/SharedSupport/SharedSupport.dmg" => {
+                    shared_support = fork.logical_size > 0;
+                    shared_support_id = Some(*file_id);
+                    shared_support_fork = Some(fork.clone());
+                }
+                _ => {}
+            }
+        }
+        let architecture = boot_architecture.unwrap_or_default();
+        let Some(shared_id) = shared_support_id else {
+            if blessed_core_services {
+                evidence
+                    .checks
+                    .push("Blessed CoreServices folder verified".into());
+            }
+            if !architecture.is_empty() {
+                evidence
+                    .checks
+                    .push(format!("EFI boot.efi verified ({architecture})"));
+            }
+            if platform_support {
+                evidence.checks.push("PlatformSupport.plist found".into());
+            }
+            if base_system {
+                evidence.checks.push("BaseSystem.dmg found".into());
+            }
+            if installer_bundle {
+                evidence
+                    .checks
+                    .push("Ventura installer application found".into());
+            }
+            evidence.architecture = architecture;
+            evidence.supported_models = platform_models;
+            return evidence;
+        };
+        if let (Some(file_id), Some(fork)) = (base_system_id, base_system_fork) {
+            base_system_udif = hfs_fork_has_udif_trailer(
+                file,
+                partition_start,
+                block_size,
+                total_blocks,
+                &extents_fork,
+                file_id,
+                &fork,
+                image_size,
+            );
+        }
+        if let Some(fork) = shared_support_fork {
+            shared_support_udif = hfs_fork_has_udif_trailer(
+                file,
+                partition_start,
+                block_size,
+                total_blocks,
+                &extents_fork,
+                shared_id,
+                &fork,
+                image_size,
+            );
+        }
+        if blessed_core_services {
+            evidence
+                .checks
+                .push("Blessed CoreServices folder verified".into());
+        }
+        if !architecture.is_empty() {
+            evidence
+                .checks
+                .push(format!("EFI boot.efi verified ({architecture})"));
+        }
+        if platform_support {
+            evidence.checks.push("PlatformSupport.plist found".into());
+        }
+        if base_system {
+            evidence.checks.push("BaseSystem.dmg found".into());
+        }
+        if base_system_udif {
+            evidence
+                .checks
+                .push("BaseSystem.dmg extent map and UDIF trailer verified".into());
+        }
+        if installer_bundle {
+            evidence
+                .checks
+                .push("Ventura installer application found".into());
+        }
+        if shared_support {
+            evidence.checks.push("SharedSupport.dmg found".into());
+        }
+        if shared_support_udif {
+            evidence
+                .checks
+                .push("SharedSupport.dmg extent map and UDIF trailer verified".into());
+        }
+        evidence.architecture = architecture;
+        evidence.supported_models = platform_models;
+        evidence.validated = blessed_core_services
+            && !evidence.architecture.is_empty()
+            && platform_support
+            && base_system
+            && base_system_udif
+            && installer_bundle
+            && shared_support
+            && shared_support_udif;
+        return evidence;
+    }
+    evidence
+}
+
+fn target_model_is_supported(supported_models: &[String], selected_model: Option<&str>) -> bool {
+    selected_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .is_some_and(|model| {
+            supported_models
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(model))
+        })
+}
+
 fn image_write_readiness(
     extension: &str,
     el_torito_boot_record: bool,
     udif_signature: bool,
+    apple_partition_map_signature: bool,
+    hfs_plus_signature: bool,
+    macos_installer_validated: bool,
+    target_model_supported: bool,
 ) -> &'static str {
     if udif_signature || extension.eq_ignore_ascii_case("dmg") {
         "Not ready: macOS DMG requires Apple's installer-specific workflow, which is not implemented."
@@ -453,6 +1216,18 @@ fn image_write_readiness(
         "wim" | "esd" | "vhd" | "vhdx"
     ) {
         "Not ready: this is a container format, not a directly writable boot image."
+    } else if apple_partition_map_signature
+        && hfs_plus_signature
+        && macos_installer_validated
+        && target_model_supported
+    {
+        "macOS installer structure verified and the selected Mac model is listed in PlatformSupport.plist. Firmware startup policy and the safe writing method still require confirmation; writing remains disabled."
+    } else if apple_partition_map_signature && hfs_plus_signature && macos_installer_validated {
+        "macOS installer structure verified, but a supported target Mac model has not been selected. Choose a model from the detected compatibility list before any write; writing remains disabled."
+    } else if apple_partition_map_signature && hfs_plus_signature {
+        "Not ready: Apple Partition Map and HFS+ volume detected, but the complete macOS boot files and installer payload could not be validated; writing remains disabled."
+    } else if apple_partition_map_signature {
+        "Not ready: Apple Partition Map detected, but a valid HFS+ volume and macOS boot structure were not confirmed."
     } else if extension.eq_ignore_ascii_case("iso") && el_torito_boot_record {
         "Candidate only: El Torito boot record detected. Target operating-system and firmware compatibility still need validation; writing is not implemented."
     } else if extension.eq_ignore_ascii_case("iso") {
@@ -548,6 +1323,37 @@ fn drive_helper_source() -> &'static str {
 fn helper_version_supported(contents: &str) -> bool {
     contents == drive_helper_source()
 }
+fn valid_mac_model_identifier(model: &str) -> bool {
+    let model = model.trim();
+    !model.is_empty()
+        && model.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == ',' || character == '.'
+        })
+}
+
+#[tauri::command]
+fn detect_target_mac_model() -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("sysctl")
+            .args(["-n", "hw.model"])
+            .output()
+            .map_err(|e| format!("Could not query this Mac's hardware model: {e}"))?;
+        if !output.status.success() {
+            return Err("macOS did not provide this Mac's hardware model.".into());
+        }
+        let model = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !valid_mac_model_identifier(&model) {
+            return Err("macOS returned an invalid hardware model identifier.".into());
+        }
+        return Ok(Some(model));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+}
+
 #[tauri::command]
 fn drive_helper_installed() -> bool {
     drive_helper_path()
@@ -915,7 +1721,16 @@ fn open_raw_device_exclusive(disk_number: u32) -> Result<File, String> {
 }
 
 #[tauri::command]
-fn inspect_image(path: String) -> Result<ImageInspection, String> {
+async fn inspect_image(app: tauri::AppHandle, path: String) -> Result<ImageInspection, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_image_sync(path, Some(app)))
+        .await
+        .map_err(|e| format!("Image inspection task failed: {e}"))?
+}
+
+fn inspect_image_sync(
+    path: String,
+    progress_app: Option<tauri::AppHandle>,
+) -> Result<ImageInspection, String> {
     let image_path = Path::new(&path);
     if !image_path.is_file() {
         return Err("The selected image file could not be found.".into());
@@ -939,7 +1754,10 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         .to_string();
 
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let total_bytes = metadata.len().max(1);
+    let mut processed_bytes = 0_u64;
+    let mut last_percent = u8::MAX;
     loop {
         let count = file
             .read(&mut buffer)
@@ -948,6 +1766,18 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
             break;
         }
         hasher.update(&buffer[..count]);
+        processed_bytes += count as u64;
+        let percent = ((processed_bytes as u128 * 100) / total_bytes as u128).min(100) as u8;
+        if percent != last_percent {
+            last_percent = percent;
+            if let Some(app) = &progress_app {
+                use tauri::Emitter;
+                let _ = app.emit(
+                    "image-inspection-progress",
+                    format!("Hashing image: {percent}%"),
+                );
+            }
+        }
     }
     let after_handle_metadata = file
         .metadata()
@@ -1013,8 +1843,18 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         false
     };
 
+    let (apple_partition_map_signature, hfs_plus_signature) =
+        inspect_apple_partitioned_hfs(&mut file, metadata.len());
+    let macos_boot = inspect_macos_boot_structure(&mut file, metadata.len());
+
     let detected_format = if udif_signature {
         "Apple UDIF disk image (DMG)".to_string()
+    } else if apple_partition_map_signature && hfs_plus_signature && macos_boot.validated {
+        "Validated macOS installer (Apple Partition Map + HFS+)".to_string()
+    } else if apple_partition_map_signature && hfs_plus_signature {
+        "Apple Partition Map with HFS+ volume".to_string()
+    } else if apple_partition_map_signature {
+        "Apple Partition Map disk image".to_string()
     } else if iso9660_signature {
         "ISO 9660".to_string()
     } else {
@@ -1030,6 +1870,10 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
     let macos_candidate = matches!(extension.as_str(), "dmg" | "iso" | "img" | "raw");
     let bootability = if udif_signature {
         "Apple UDIF container detected. This does not prove it is a full macOS installer or a bootable USB source.".into()
+    } else if apple_partition_map_signature && hfs_plus_signature && macos_boot.validated {
+        format!("macOS installer boot structures validated, including the blessed CoreServices folder, {} EFI bootloader, BaseSystem and SharedSupport DMG payloads. Exact target-Mac compatibility still needs confirmation.", macos_boot.architecture)
+    } else if apple_partition_map_signature && hfs_plus_signature {
+        "Apple Partition Map and HFS+ volume detected, but the complete macOS boot and installer payload structure could not be validated.".into()
     } else if el_torito_boot_record {
         "El Torito boot record detected. Confirm operating-system compatibility before writing."
             .into()
@@ -1042,22 +1886,9 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         "Not identified as a supported macOS installer image.".into()
     };
 
-    file.seek(SeekFrom::Start(0))
-        .map_err(|e| format!("Could not restart image integrity verification: {e}"))?;
-    let mut verification_hasher = Sha256::new();
-    loop {
-        let count = file.read(&mut buffer).map_err(|e| {
-            format!("Could not verify image integrity after header inspection: {e}")
-        })?;
-        if count == 0 {
-            break;
-        }
-        verification_hasher.update(&buffer[..count]);
-    }
-    let verification_sha256 = format!("{:x}", verification_hasher.finalize());
-    if !verification_sha256.eq_ignore_ascii_case(&sha256) {
-        return Err("The image contents changed during inspection. Select the file again and repeat inspection. Nothing was written.".into());
-    }
+    // Hash once during inspection. The read-only preflight reopens the source and
+    // recalculates SHA-256 immediately before any future write, avoiding a second
+    // full pass over very large images here while preserving the write-time integrity gate.
     let final_handle_metadata = file
         .metadata()
         .map_err(|e| format!("Could not perform final image integrity check: {e}"))?;
@@ -1069,12 +1900,18 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         return Err("The image changed during inspection. Select it again and repeat inspection. Nothing was written.".into());
     }
 
-    let write_compatibility = image_write_compatibility(
-        &extension,
-        iso9660_signature,
-        el_torito_boot_record,
-        udif_signature,
-    )
+    let write_compatibility = if apple_partition_map_signature && hfs_plus_signature && macos_boot.validated {
+        "macOS installer structure verified; target Mac model and safe USB writing method still need confirmation"
+    } else if apple_partition_map_signature && hfs_plus_signature {
+        "Apple partition map and HFS+ detected; full macOS installer boot structure is not verified"
+    } else {
+        image_write_compatibility(
+            &extension,
+            iso9660_signature,
+            el_torito_boot_record,
+            udif_signature,
+        )
+    }
     .to_string();
 
     Ok(ImageInspection {
@@ -1085,8 +1922,14 @@ fn inspect_image(path: String) -> Result<ImageInspection, String> {
         detected_format,
         iso9660_signature,
         el_torito_boot_record,
+        apple_partition_map_signature,
+        hfs_plus_signature,
         udif_signature,
         macos_candidate,
+        macos_installer_validated: macos_boot.validated,
+        macos_boot_architecture: macos_boot.architecture,
+        macos_boot_evidence: macos_boot.checks,
+        macos_supported_models: macos_boot.supported_models,
         sha256,
         bootability,
         write_compatibility,
@@ -1099,6 +1942,7 @@ fn preflight_write(
     expected_unique_id: String,
     image_path: String,
     expected_sha256: String,
+    target_mac_model: Option<String>,
 ) -> Result<PreflightReport, String> {
     #[cfg(target_os = "windows")]
     {
@@ -1149,17 +1993,23 @@ fn preflight_write(
             return Err("The selected USB device identity changed since selection. Scan again and re-select the intended drive. Nothing was written.".into());
         }
         let disk_size = disk.size.unwrap_or(0);
-        let image = inspect_image(image_path)?;
+        let image = inspect_image_sync(image_path, None)?;
         if !image.sha256.eq_ignore_ascii_case(expected_sha256.trim()) {
             return Err("The selected image changed after inspection. Re-select the image and run preflight again. Nothing was written.".into());
         }
         if image.size_bytes > disk_size {
             return Err(format!("The image is larger than the selected USB drive ({} bytes available, {} bytes required). Nothing was written.", disk_size, image.size_bytes));
         }
+        let target_model_supported =
+            target_model_is_supported(&image.macos_supported_models, target_mac_model.as_deref());
         let write_readiness = image_write_readiness(
             &image.extension,
             image.el_torito_boot_record,
             image.udif_signature,
+            image.apple_partition_map_signature,
+            image.hfs_plus_signature,
+            image.macos_installer_validated,
+            target_model_supported,
         )
         .to_string();
         let confirmation_phrase = erase_confirmation_phrase(disk_number, &actual_id, &image.sha256);
@@ -1261,7 +2111,7 @@ fn preflight_write(
         if expected_unique_id.trim().is_empty() || stable_id != expected_unique_id {
             return Err("The selected external disk identity changed. Scan again and re-select it. Nothing was written.".into());
         }
-        let image = inspect_image(image_path)?;
+        let image = inspect_image_sync(image_path, None)?;
 
         if !image.sha256.eq_ignore_ascii_case(expected_sha256.trim()) {
             return Err("The selected image changed after inspection. Re-select the image and run preflight again. Nothing was written.".into());
@@ -1269,10 +2119,16 @@ fn preflight_write(
         if image.size_bytes > disk_size {
             return Err(format!("The image is larger than the selected external disk ({} bytes available, {} bytes required). Nothing was written.", disk_size, image.size_bytes));
         }
+        let target_model_supported =
+            target_model_is_supported(&image.macos_supported_models, target_mac_model.as_deref());
         let write_readiness = image_write_readiness(
             &image.extension,
             image.el_torito_boot_record,
             image.udif_signature,
+            image.apple_partition_map_signature,
+            image.hfs_plus_signature,
+            image.macos_installer_validated,
+            target_model_supported,
         )
         .to_string();
         let confirmation_phrase = erase_confirmation_phrase(disk_number, &stable_id, &image.sha256);
@@ -1355,14 +2211,71 @@ mod tests {
     }
 
     #[test]
+    fn mac_model_identifier_validation_rejects_malformed_values() {
+        assert!(valid_mac_model_identifier("MacBookPro18,3"));
+        assert!(valid_mac_model_identifier("Mac14.7"));
+        assert!(!valid_mac_model_identifier(""));
+        assert!(!valid_mac_model_identifier("   "));
+        assert!(!valid_mac_model_identifier("MacBook Pro"));
+        assert!(!valid_mac_model_identifier("../MacBookPro18,3"));
+    }
+
+    #[test]
+    fn target_mac_model_must_match_installer_platform_support() {
+        let models = vec!["MacBookPro14,2".to_string(), "MacBookAir9,1".to_string()];
+        assert!(target_model_is_supported(&models, Some("MacBookPro14,2")));
+        assert!(target_model_is_supported(&models, Some("macbookair9,1")));
+        assert!(!target_model_is_supported(&models, None));
+        assert!(!target_model_is_supported(&models, Some("MacBookPro99,9")));
+        assert!(!target_model_is_supported(&models, Some("  ")));
+    }
+
+    #[test]
     fn write_readiness_never_confuses_preflight_with_write_support() {
-        assert!(image_write_readiness("iso", true, false).starts_with("Candidate only"));
-        assert!(image_write_readiness("iso", false, false).contains("no El Torito"));
-        assert!(image_write_readiness("dmg", false, true).contains("Apple's installer"));
-        assert!(image_write_readiness("wim", false, false).contains("container format"));
-        assert!(image_write_readiness("vhdx", false, false).contains("container format"));
-        assert!(image_write_readiness("img", false, false).contains("partition layout"));
-        assert!(image_write_readiness("unknown", false, false).contains("not supported"));
+        assert!(
+            image_write_readiness("iso", true, false, false, false, false, false)
+                .starts_with("Candidate only")
+        );
+        assert!(
+            image_write_readiness("iso", false, false, false, false, false, false)
+                .contains("no El Torito")
+        );
+        assert!(
+            image_write_readiness("dmg", false, true, false, false, false, false)
+                .contains("Apple's installer")
+        );
+        assert!(
+            image_write_readiness("wim", false, false, false, false, false, false)
+                .contains("container format")
+        );
+        assert!(
+            image_write_readiness("vhdx", false, false, false, false, false, false)
+                .contains("container format")
+        );
+        assert!(
+            image_write_readiness("img", false, false, false, false, false, false)
+                .contains("partition layout")
+        );
+        assert!(
+            image_write_readiness("unknown", false, false, false, false, false, false)
+                .contains("not supported")
+        );
+        assert!(
+            image_write_readiness("iso", false, false, true, true, false, false)
+                .contains("could not be validated")
+        );
+        assert!(
+            image_write_readiness("iso", false, false, true, true, true, false)
+                .contains("supported target Mac model has not been selected")
+        );
+        assert!(
+            image_write_readiness("iso", false, false, true, true, true, true)
+                .contains("selected Mac model is listed")
+        );
+        assert!(
+            image_write_readiness("iso", false, false, true, false, false, false)
+                .contains("valid HFS+")
+        );
     }
 
     #[test]
@@ -1571,12 +2484,93 @@ mod tests {
         catalog[28..30].copy_from_slice(&sum.wrapping_neg().to_le_bytes());
         bytes[20 * 2048..20 * 2048 + 64].copy_from_slice(&catalog);
         fs::write(&path, &bytes).unwrap();
-        let result = inspect_image(path.to_string_lossy().to_string()).unwrap();
+        let result = inspect_image_sync(path.to_string_lossy().to_string(), None).unwrap();
         assert!(result.iso9660_signature);
         assert!(result.el_torito_boot_record);
         assert!(!result.udif_signature);
         assert_eq!(result.sha256.len(), 64);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn detects_apple_partition_map_and_hfs_plus_volume_without_claiming_bootability() {
+        let path = std::env::temp_dir().join(format!(
+            "allboot-apm-{}-test.img",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut bytes = vec![0_u8; 1024 * 1024];
+        let entry = |start: u32, blocks: u32, name: &str, kind: &str| {
+            let mut data = [0_u8; 512];
+            data[..2].copy_from_slice(b"PM");
+            data[4..8].copy_from_slice(&3_u32.to_be_bytes());
+            data[8..12].copy_from_slice(&start.to_be_bytes());
+            data[12..16].copy_from_slice(&blocks.to_be_bytes());
+            data[16..16 + name.len()].copy_from_slice(name.as_bytes());
+            data[48..48 + kind.len()].copy_from_slice(kind.as_bytes());
+            data
+        };
+        bytes[512..1024].copy_from_slice(&entry(1, 63, "Apple", "Apple_partition_map"));
+        bytes[1024..1536].copy_from_slice(&entry(64, 100, "Free", "Apple_Free"));
+        bytes[1536..2048].copy_from_slice(&entry(256, 1792, "disk image", "Apple_HFS"));
+        let hfs_header = 256 * 512 + 1024;
+        bytes[hfs_header..hfs_header + 2].copy_from_slice(b"H+");
+        fs::write(&path, &bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(
+            inspect_apple_partitioned_hfs(&mut file, bytes.len() as u64),
+            (true, true)
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn real_ventura_full_image_inspection_when_fixture_path_is_supplied() {
+        let Some(path) = std::env::var_os("ALLBOOT_VENTURA_ISO_FIXTURE") else {
+            return;
+        };
+        let image = inspect_image_sync(path.to_string_lossy().to_string(), None)
+            .expect("full Ventura image inspection should complete without writing");
+        assert!(image.macos_installer_validated);
+        assert_eq!(image.macos_boot_architecture, "x86_64");
+        assert!(!image.macos_supported_models.is_empty());
+        println!(
+            "Full read-only Ventura inspection: {} bytes, SHA-256 {}, {} supported models",
+            image.size_bytes,
+            image.sha256,
+            image.macos_supported_models.len()
+        );
+    }
+
+    #[test]
+    fn validates_real_ventura_boot_structures_when_fixture_path_is_supplied() {
+        let Some(path) = std::env::var_os("ALLBOOT_VENTURA_ISO_FIXTURE") else {
+            return;
+        };
+        let metadata = fs::metadata(&path).expect("Ventura fixture metadata should be readable");
+        let mut file = File::open(&path).expect("Ventura fixture should be readable");
+        let evidence = inspect_macos_boot_structure(&mut file, metadata.len());
+        assert!(evidence.validated, "macOS evidence: {:?}", evidence.checks);
+        assert_eq!(evidence.architecture, "x86_64");
+        println!(
+            "Validated installer model identifiers ({}): {}",
+            evidence.supported_models.len(),
+            evidence.supported_models.join(", ")
+        );
+        assert!(
+            !evidence.supported_models.is_empty(),
+            "installer model list should be parsed"
+        );
+        assert!(evidence
+            .checks
+            .iter()
+            .any(|item| item.contains("SharedSupport.dmg extent map")));
+        assert!(evidence
+            .checks
+            .iter()
+            .any(|item| item.contains("BaseSystem.dmg extent map")));
     }
 
     #[test]
@@ -1589,11 +2583,57 @@ mod tests {
                 .as_nanos()
         ));
         fs::write(&path, vec![0_u8; 1024]).unwrap();
-        let result = inspect_image(path.to_string_lossy().to_string()).unwrap();
+        let result = inspect_image_sync(path.to_string_lossy().to_string(), None).unwrap();
         assert!(!result.udif_signature);
         assert!(result.detected_format.contains("not detected"));
         fs::remove_file(path).unwrap();
     }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn real_ventura_usb_preflight_rechecks_identity_and_stays_read_only() {
+        let (Some(image_path), Some(disk_number)) = (
+            std::env::var_os("ALLBOOT_VENTURA_ISO_FIXTURE"),
+            std::env::var("ALLBOOT_TARGET_USB_DISK").ok(),
+        ) else {
+            return;
+        };
+        let disk_number: u32 = disk_number
+            .parse()
+            .expect("target disk number must be numeric");
+        let drives = list_destination_drives().expect("USB inventory should be readable");
+        let drive = drives
+            .iter()
+            .find(|drive| drive.disk_number == disk_number)
+            .expect("selected SanDisk USB should remain eligible");
+        assert!(drive.name.to_ascii_lowercase().contains("sandisk"));
+        assert_eq!(drive.bus_type, "USB");
+        let image = inspect_image_sync(image_path.to_string_lossy().to_string(), None)
+            .expect("Ventura ISO should pass read-only inspection");
+        assert!(image.macos_installer_validated);
+        let report = preflight_write(
+            drive.disk_number,
+            drive.unique_id.clone(),
+            image.path,
+            image.sha256,
+            None,
+        )
+        .expect("real USB identity and image hash should pass read-only preflight");
+        assert_eq!(report.disk_number, disk_number);
+        assert!(report
+            .write_readiness
+            .contains("supported target Mac model has not been selected"));
+        assert_eq!(report.checks.len(), 6);
+        println!(
+            "Real Ventura USB preflight: {} (Disk {}, {} bytes); readiness: {}",
+            report.drive_name, report.disk_number, report.disk_size_bytes, report.write_readiness
+        );
+        println!("Read-only checks: {}", report.checks.join("; "));
+        println!(
+            "Future erase challenge generated but not accepted: {}",
+            report.confirmation_phrase
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn safe_preflight_rechecks_real_usb_identity_without_writing() {
@@ -1619,9 +2659,10 @@ mod tests {
                 drive.disk_number,
                 drive.unique_id.clone(),
                 path.to_string_lossy().to_string(),
-                inspect_image(path.to_string_lossy().to_string())
+                inspect_image_sync(path.to_string_lossy().to_string(), None)
                     .unwrap()
                     .sha256,
+                None,
             )
             .expect("matching USB identity should pass read-only preflight");
             assert_eq!(report.disk_number, drive.disk_number);
@@ -1633,9 +2674,10 @@ mod tests {
                 drive.disk_number,
                 "not-the-real-device-id".into(),
                 path.to_string_lossy().to_string(),
-                inspect_image(path.to_string_lossy().to_string())
+                inspect_image_sync(path.to_string_lossy().to_string(), None)
                     .unwrap()
                     .sha256,
+                None,
             );
             assert!(mismatch.is_err(), "changed device identity must be blocked");
             fs::remove_file(path).unwrap();
@@ -2114,6 +3156,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             list_destination_drives,
+            detect_target_mac_model,
             drive_helper_installed,
             install_drive_helper,
             inspect_image,
