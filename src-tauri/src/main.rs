@@ -1770,7 +1770,7 @@ fn raw_device_path(disk_number: u32) -> Result<String, String> {
     }
     #[cfg(target_os = "windows")]
     {
-        return Ok(format!(r"\.\PhysicalDrive{disk_number}"));
+        return Ok(format!(r"\\.\PhysicalDrive{disk_number}"));
     }
     #[cfg(target_os = "macos")]
     {
@@ -3370,7 +3370,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_raw_device_path_uses_physical_drive_namespace() {
-        assert_eq!(raw_device_path(12).unwrap(), r"\.\PhysicalDrive12");
+        assert_eq!(raw_device_path(12).unwrap(), r"\\.\PhysicalDrive12");
     }
 
     #[cfg(target_os = "macos")]
