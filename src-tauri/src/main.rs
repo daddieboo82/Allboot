@@ -2314,6 +2314,12 @@ mod tests {
         assert!(!valid_mac_model_identifier("../MacBookPro18,3"));
     }
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_mac_host_does_not_guess_a_target_mac_model() {
+        assert_eq!(detect_target_mac_model().unwrap(), None);
+    }
+
     #[test]
     fn target_mac_model_must_match_installer_platform_support() {
         let models = vec!["MacBookPro14,2".to_string(), "MacBookAir9,1".to_string()];
