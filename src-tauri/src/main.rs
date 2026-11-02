@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
@@ -641,7 +642,7 @@ fn btree_leaf_records(
     }
     None
 }
-fn hfs_folder_path(folders: &[(u32, u32, String)], folder_id: u32) -> Option<String> {
+fn hfs_folder_path(folders: &HashMap<u32, (u32, String)>, folder_id: u32) -> Option<String> {
     if folder_id == 2 {
         return Some(String::new());
     }
@@ -657,7 +658,7 @@ fn hfs_folder_path(folders: &[(u32, u32, String)], folder_id: u32) -> Option<Str
             return None;
         }
         visited.push(current);
-        let (_, parent, name) = folders.iter().find(|(id, _, _)| *id == current)?;
+        let (parent, name) = folders.get(&current)?;
         components.push(name.clone());
         current = *parent;
     }
@@ -1028,7 +1029,13 @@ fn inspect_macos_boot_structure(file: &mut File, image_size: u64) -> MacOsBootEv
                 _ => {}
             }
         }
-        let folder_path = |folder_id: u32| hfs_folder_path(&folders, folder_id);
+        // Resolve HFS catalog parent IDs through a hash map. Searching the full
+        // folder vector for every file made large installer catalogs quadratic.
+        let mut folder_lookup = HashMap::with_capacity(folders.len());
+        for (id, parent, name) in &folders {
+            folder_lookup.entry(*id).or_insert((*parent, name.clone()));
+        }
+        let folder_path = |folder_id: u32| hfs_folder_path(&folder_lookup, folder_id);
         let blessed_path = folder_path(blessed_folder_id);
         let blessed_core_services = blessed_path
             .as_deref()
@@ -1050,6 +1057,15 @@ fn inspect_macos_boot_structure(file: &mut File, image_size: u64) -> MacOsBootEv
         let mut shared_support_id = None;
         let mut shared_support_fork = None;
         for (parent, name, file_id, fork) in &files {
+            // Only four catalog entries can contribute to the boot evidence.
+            // Avoid resolving parent paths for every unrelated file in a large
+            // installer volume.
+            if !matches!(
+                name.as_str(),
+                "boot.efi" | "PlatformSupport.plist" | "BaseSystem.dmg" | "SharedSupport.dmg"
+            ) {
+                continue;
+            }
             let Some(parent_path) = folder_path(*parent) else {
                 continue;
             };
@@ -2187,6 +2203,27 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn resolves_hfs_catalog_paths_with_parent_lookup_and_rejects_cycles() {
+        let folders = HashMap::from([
+            (10, (2, "System".to_string())),
+            (11, (10, "Library".to_string())),
+            (12, (11, "CoreServices".to_string())),
+        ]);
+        assert_eq!(
+            hfs_folder_path(&folders, 12).as_deref(),
+            Some("System/Library/CoreServices")
+        );
+        assert_eq!(hfs_folder_path(&folders, 2).as_deref(), Some(""));
+        assert_eq!(hfs_folder_path(&folders, 999), None);
+
+        let cyclic = HashMap::from([
+            (10, (11, "First".to_string())),
+            (11, (10, "Second".to_string())),
+        ]);
+        assert_eq!(hfs_folder_path(&cyclic, 10), None);
+    }
 
     #[test]
     fn rejects_oversized_hfs_btree_before_scanning_or_allocating_records() {
