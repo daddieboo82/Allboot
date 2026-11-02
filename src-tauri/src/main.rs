@@ -3124,6 +3124,38 @@ mod tests {
     }
 
     #[test]
+    fn verified_write_pipeline_stops_after_midstream_cancellation() {
+        let bytes = vec![0x6B_u8; 2 * 1024 * 1024];
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let phrase = erase_confirmation_phrase(9, "USB-TEST-9", &hash);
+        let mut source = std::io::Cursor::new(bytes.clone());
+        let mut destination = std::io::Cursor::new(vec![0xA5_u8; bytes.len()]);
+        let mut cancellation_checks = 0;
+        let result = write_verified_stream(
+            &mut source,
+            &mut destination,
+            bytes.len() as u64,
+            bytes.len() as u64,
+            9,
+            "USB-TEST-9",
+            &hash,
+            &phrase,
+            || {
+                cancellation_checks += 1;
+                cancellation_checks > 1
+            },
+            |_| {},
+        );
+        let error = result.expect_err("midstream cancellation must not report success");
+        assert!(error.contains("cancelled"));
+        assert_eq!(cancellation_checks, 2);
+        assert_eq!(&destination.get_ref()[..1024 * 1024], &bytes[..1024 * 1024]);
+        assert!(destination.get_ref()[1024 * 1024..]
+            .iter()
+            .all(|byte| *byte == 0xA5));
+    }
+
+    #[test]
     fn image_stream_copies_exact_bytes_and_reports_monotonic_progress() {
         let source = vec![0x5A_u8; 2 * 1024 * 1024 + 17];
         let mut reader = std::io::Cursor::new(source.clone());
