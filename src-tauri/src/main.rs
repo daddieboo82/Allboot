@@ -7,7 +7,10 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
     process::Command,
+    sync::atomic::{AtomicBool, Ordering},
 };
+
+static USB_WRITE_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1306,36 +1309,38 @@ fn image_write_readiness(
     macos_installer_validated: bool,
     target_model_supported: bool,
 ) -> &'static str {
-    if udif_signature || extension.eq_ignore_ascii_case("dmg") {
-        "Not ready: macOS DMG requires Apple's installer-specific workflow, which is not implemented."
+    if udif_signature {
+        "Not ready for direct writing: this is Apple's compressed UDIF container. Conversion is not implemented; the image remains selectable and inspectable."
     } else if matches!(
         extension.to_ascii_lowercase().as_str(),
         "wim" | "esd" | "vhd" | "vhdx"
     ) {
-        "Not ready: this is a container format, not a directly writable boot image."
+        "Not ready for direct writing: this is a deployment/container format, not a raw disk image. A format-specific deployment or conversion workflow is required."
+    } else if !matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "iso" | "img" | "raw" | "bin" | "dmg" | "dd" | "dsk" | "ima"
+    ) && !apple_partition_map_signature
+        && !el_torito_boot_record
+    {
+        "Not ready for direct writing: the selected file is not recognized as a supported raw disk image. It remains selectable and inspectable."
     } else if apple_partition_map_signature
         && hfs_plus_signature
         && macos_installer_validated
         && target_model_supported
     {
-        "macOS installer structure verified and the selected Mac model is listed in PlatformSupport.plist. Firmware startup policy and the safe writing method still require confirmation; writing remains disabled."
+        "Direct byte-for-byte writing is available. macOS installer structure was verified and the selected Mac model is listed; actual firmware startup still requires a hardware test."
     } else if apple_partition_map_signature && hfs_plus_signature && macos_installer_validated {
-        "macOS installer structure verified, but a supported target Mac model has not been selected. Choose a model from the detected compatibility list before any write; writing remains disabled."
+        "Direct byte-for-byte writing is available. macOS installer structure was verified; target-model selection is optional."
     } else if apple_partition_map_signature && hfs_plus_signature {
-        "Not ready: Apple Partition Map and HFS+ volume detected, but the complete macOS boot files and installer payload could not be validated; writing remains disabled."
+        "Direct byte-for-byte writing is available. Apple Partition Map and HFS+ were detected, but full macOS bootability was not verified."
     } else if apple_partition_map_signature {
-        "Not ready: Apple Partition Map detected, but a valid HFS+ volume and macOS boot structure were not confirmed."
-    } else if extension.eq_ignore_ascii_case("iso") && el_torito_boot_record {
-        "Candidate only: El Torito boot record detected. Target operating-system and firmware compatibility still need validation; writing is not implemented."
+        "Direct byte-for-byte writing is available. Apple partition metadata was detected; filesystem and bootability are unverified."
+    } else if el_torito_boot_record {
+        "Direct byte-for-byte writing is available. El Torito boot metadata was detected; operating-system and firmware compatibility are not guaranteed."
     } else if extension.eq_ignore_ascii_case("iso") {
-        "Not ready: no El Torito boot record was detected in this ISO."
-    } else if matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "img" | "raw" | "bin"
-    ) {
-        "Not ready: raw-image boot structure and partition layout are not yet validated by AllBoot."
+        "Direct byte-for-byte ISO writing is available. No El Torito boot record was detected; the resulting media may not boot."
     } else {
-        "Not ready: image format is not supported by a verified writing workflow."
+        "Direct byte-for-byte raw-image writing is available. AllBoot will copy the selected file unchanged; bootability and partition layout are unverified."
     }
 }
 
@@ -1345,8 +1350,8 @@ fn image_write_compatibility(
     el_torito_boot_record: bool,
     udif_signature: bool,
 ) -> &'static str {
-    if udif_signature || extension.eq_ignore_ascii_case("dmg") {
-        "macOS installer workflow required; do not raw-write this DMG"
+    if udif_signature {
+        "compressed UDIF container; conversion is required before raw USB writing"
     } else if matches!(
         extension.to_ascii_lowercase().as_str(),
         "wim" | "esd" | "vhd" | "vhdx"
@@ -1358,7 +1363,7 @@ fn image_write_compatibility(
         "ISO 9660 detected without El Torito boot record; bootability is unconfirmed"
     } else if matches!(
         extension.to_ascii_lowercase().as_str(),
-        "img" | "raw" | "bin"
+        "img" | "raw" | "bin" | "dd" | "dsk" | "ima"
     ) {
         "raw-image candidate; bootability and partition layout are unverified"
     } else {
@@ -1800,11 +1805,280 @@ fn raw_device_path(disk_number: u32) -> Result<String, String> {
 }
 
 #[cfg(target_os = "windows")]
-#[allow(dead_code)] // Activated only by the future, separately confirmed physical-write command.
+mod windows_volume_lock {
+    use std::{ffi::c_void, fs::File};
+
+    type Handle = *mut c_void;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+    const IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS: u32 = 0x0056_0000;
+    const FSCTL_LOCK_VOLUME: u32 = 0x0009_0018;
+    const FSCTL_DISMOUNT_VOLUME: u32 = 0x0009_0020;
+    const ERROR_NO_MORE_FILES: u32 = 18;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn FindFirstVolumeW(name: *mut u16, length: u32) -> Handle;
+        fn FindNextVolumeW(search: Handle, name: *mut u16, length: u32) -> i32;
+        fn FindVolumeClose(search: Handle) -> i32;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            creation: u32,
+            flags: u32,
+            template: Handle,
+        ) -> Handle;
+        fn DeviceIoControl(
+            device: Handle,
+            control: u32,
+            input: *mut c_void,
+            input_size: u32,
+            output: *mut c_void,
+            output_size: u32,
+            returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    pub(super) struct VolumeHandle(Handle);
+    // The handle is created, used, and dropped entirely inside one blocking worker.
+    unsafe impl Send for VolumeHandle {}
+    impl Drop for VolumeHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    struct VolumeSearch(Handle);
+    impl Drop for VolumeSearch {
+        fn drop(&mut self) {
+            unsafe {
+                FindVolumeClose(self.0);
+            }
+        }
+    }
+
+    fn win_error(action: &str, volume: &str) -> String {
+        let code = unsafe { GetLastError() };
+        format!("{action} for {volume} failed (Windows error {code}). Close programs using this USB and retry; no image was written.")
+    }
+
+    fn volume_extents(handle: Handle, volume: &str) -> Result<Vec<u32>, String> {
+        let mut buffer = vec![0_u64; 1024];
+        let mut returned = 0_u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                std::ptr::null_mut(),
+                0,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * std::mem::size_of::<u64>()) as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(win_error(
+                "Could not identify the physical disk backing volume",
+                volume,
+            ));
+        }
+        let capacity = buffer.len() * std::mem::size_of::<u64>();
+        if returned as usize > capacity {
+            return Err(format!(
+                "Windows returned an invalid extent-buffer length for {volume}. Nothing was written."
+            ));
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), returned as usize) };
+        if bytes.len() < 8 {
+            return Err(format!(
+                "Windows returned incomplete disk extents for {volume}. Nothing was written."
+            ));
+        }
+        let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let offset = 8usize;
+        let extent_size = 24usize;
+        if count == 0 || count > bytes.len().saturating_sub(offset) / extent_size {
+            return Err(format!(
+                "Windows returned invalid disk extents for {volume}. Nothing was written."
+            ));
+        }
+        let mut disks = Vec::with_capacity(count);
+        for index in 0..count {
+            let start = offset + index * extent_size;
+            disks.push(u32::from_le_bytes(
+                bytes[start..start + 4].try_into().unwrap(),
+            ));
+        }
+        Ok(disks)
+    }
+
+    fn open_volume(name: &str, access: u32) -> Result<VolumeHandle, String> {
+        let mut path = name
+            .trim_end_matches('\\')
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        path.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(win_error("Could not open volume", name));
+        }
+        Ok(VolumeHandle(handle))
+    }
+
+    fn lock_and_dismount(handle: Handle, name: &str) -> Result<(), String> {
+        let mut returned = 0_u32;
+        if unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_LOCK_VOLUME,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(win_error("Could not lock volume", name));
+        }
+        if unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_DISMOUNT_VOLUME,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(win_error("Could not dismount volume", name));
+        }
+        Ok(())
+    }
+
+    pub fn verify_physical_disk_handle(
+        file: &File,
+        expected_disk_number: u32,
+    ) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle;
+        const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = 0x002D_1080;
+        #[repr(C)]
+        struct StorageDeviceNumber {
+            device_type: u32,
+            device_number: u32,
+            partition_number: u32,
+        }
+        let mut number = StorageDeviceNumber {
+            device_type: 0,
+            device_number: 0,
+            partition_number: 0,
+        };
+        let mut returned = 0_u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle().cast(),
+                IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                std::ptr::null_mut(),
+                0,
+                (&mut number as *mut StorageDeviceNumber).cast(),
+                std::mem::size_of::<StorageDeviceNumber>() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || returned as usize != std::mem::size_of::<StorageDeviceNumber>() {
+            return Err(
+                "Could not independently identify the opened raw USB handle. Nothing was written."
+                    .into(),
+            );
+        }
+        if number.device_number != expected_disk_number {
+            return Err(format!("The raw device handle resolved to Disk {}, not the selected Disk {expected_disk_number}. Nothing was written.", number.device_number));
+        }
+        Ok(())
+    }
+
+    pub fn lock_volumes_for_disk(disk_number: u32) -> Result<Vec<VolumeHandle>, String> {
+        let mut name = vec![0_u16; 1024];
+        let first = unsafe { FindFirstVolumeW(name.as_mut_ptr(), name.len() as u32) };
+        if first == INVALID_HANDLE_VALUE {
+            return Err(win_error(
+                "Could not enumerate Windows volumes",
+                "volume list",
+            ));
+        }
+        let search = VolumeSearch(first);
+        let mut locked = Vec::new();
+        loop {
+            let length = name
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(name.len());
+            let volume_name = String::from_utf16_lossy(&name[..length]);
+            let query_handle = open_volume(&volume_name, GENERIC_READ)?;
+            let disks = volume_extents(query_handle.0, &volume_name)?;
+            drop(query_handle);
+            if disks.contains(&disk_number) {
+                let write_handle = open_volume(&volume_name, GENERIC_READ | GENERIC_WRITE)?;
+                let confirmed_disks = volume_extents(write_handle.0, &volume_name)?;
+                if !confirmed_disks.contains(&disk_number) {
+                    return Err(format!("The physical disk backing {volume_name} changed during volume locking. Nothing was written."));
+                }
+                lock_and_dismount(write_handle.0, &volume_name)?;
+                locked.push(write_handle);
+            }
+            name.fill(0);
+            let next = unsafe { FindNextVolumeW(search.0, name.as_mut_ptr(), name.len() as u32) };
+            if next == 0 {
+                let error = unsafe { GetLastError() };
+                if error == ERROR_NO_MORE_FILES {
+                    break;
+                }
+                return Err(format!("Windows volume enumeration stopped unexpectedly (error {error}). Nothing was written."));
+            }
+        }
+        Ok(locked)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn lock_windows_volumes_for_disk(disk_number: u32) -> Result<Vec<impl Send>, String> {
+    windows_volume_lock::lock_volumes_for_disk(disk_number)
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)] // Activated only by the separately confirmed physical-write command.
 fn open_raw_device_exclusive(disk_number: u32) -> Result<File, String> {
     use std::os::windows::fs::OpenOptionsExt;
     let path = raw_device_path(disk_number)?;
-    std::fs::OpenOptions::new().read(true).write(true).share_mode(0).custom_flags(0x8000_0000).open(&path)
+    std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(&path)
         .map_err(|e| format!("Could not open {path} exclusively. Close applications using the USB drive and ensure AllBoot has the required permissions: {e}"))
 }
 
@@ -1967,7 +2241,7 @@ fn inspect_image_sync(
         match extension.as_str() {
             "dmg" => "DMG extension; UDIF trailer signature not detected".into(),
             "iso" => "ISO candidate; ISO 9660 primary-volume signature not found".into(),
-            "img" | "raw" | "bin" => "Raw disk-image candidate".into(),
+            "img" | "raw" | "bin" | "dd" | "dsk" | "ima" => "Raw disk-image candidate".into(),
             "vhd" | "vhdx" => "Virtual hard-disk image".into(),
             "wim" | "esd" => "Windows image container".into(),
             _ => "Unknown image format".into(),
@@ -2049,6 +2323,7 @@ fn preflight_write(
     image_path: String,
     expected_sha256: String,
     target_mac_model: Option<String>,
+    make_bootable: bool,
 ) -> Result<PreflightReport, String> {
     #[cfg(target_os = "windows")]
     {
@@ -2106,6 +2381,9 @@ fn preflight_write(
         }
         let target_model_supported =
             target_model_is_supported(&image.macos_supported_models, target_mac_model.as_deref());
+        if make_bootable && !image.el_torito_boot_record && !image.macos_installer_validated {
+            return Err("Bootable mode requires verified boot metadata in the selected image. Turn off the bootable toggle to write the image unchanged. Nothing was written.".into());
+        }
         let write_readiness = image_write_readiness(
             &image.extension,
             image.el_torito_boot_record,
@@ -2225,6 +2503,9 @@ fn preflight_write(
         }
         let target_model_supported =
             target_model_is_supported(&image.macos_supported_models, target_mac_model.as_deref());
+        if make_bootable && !image.el_torito_boot_record && !image.macos_installer_validated {
+            return Err("Bootable mode requires verified boot metadata in the selected image. Turn off the bootable toggle to write the image unchanged. Nothing was written.".into());
+        }
         let write_readiness = image_write_readiness(
             &image.extension,
             image.el_torito_boot_record,
@@ -2263,6 +2544,225 @@ fn preflight_write(
     {
         let _ = (disk_number, expected_unique_id, image_path, expected_sha256);
         Err("AllBoot preflight supports Windows and macOS.".into())
+    }
+}
+
+#[tauri::command]
+async fn write_image_to_drive(
+    app: tauri::AppHandle,
+    disk_number: u32,
+    expected_unique_id: String,
+    image_path: String,
+    expected_sha256: String,
+    confirmation_phrase: String,
+    target_mac_model: Option<String>,
+    make_bootable: bool,
+) -> Result<String, String> {
+    USB_WRITE_CANCELLED.store(false, Ordering::SeqCst);
+    #[cfg(target_os = "windows")]
+    {
+        tauri::async_runtime::spawn_blocking(move || {
+            use tauri::Emitter;
+            #[link(name = "shell32")]
+            extern "system" { fn IsUserAnAdmin() -> i32; }
+            if unsafe { IsUserAnAdmin() } == 0 {
+                return Err("Administrator permission is required to lock USB volumes and write a physical disk. No data was written. Use Restart AllBoot as administrator, then select the image and USB again.".into());
+            }
+            if disk_number == 0 {
+                return Err("Disk zero is blocked. Nothing was written.".into());
+            }
+            let helper = verified_drive_helper_path()?;
+            let query_disk = || -> Result<PowerShellDisk, String> {
+                let script = "$ErrorActionPreference='Stop'; $helper=$env:ALLBOOT_HELPER_PATH; if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) { throw 'AllBoot Drive Helper is missing.' }; $inventory = & $helper | ConvertFrom-Json; $n=[uint32]$env:ALLBOOT_DISK_NUMBER; $disk = @($inventory) | Where-Object { [uint32]$_.Number -eq $n } | Select-Object -First 1; if ($null -eq $disk) { throw 'The selected USB disk is no longer present.' }; $disk | Select-Object Number,FriendlyName,BusType,Size,SerialNumber,UniqueId,PartitionStyle,IsBoot,IsSystem | ConvertTo-Json -Compress";
+                let output = Command::new("powershell.exe")
+                    .env("ALLBOOT_DISK_NUMBER", disk_number.to_string())
+                    .env("ALLBOOT_HELPER_PATH", helper.to_string_lossy().to_string())
+                    .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
+                    .output()
+                    .map_err(|e| format!("Could not re-check the USB immediately before writing: {e}"))?;
+                if !output.status.success() {
+                    return Err(format!("USB safety re-check failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+                }
+                serde_json::from_slice(&output.stdout)
+                    .map_err(|e| format!("Could not parse the current USB identity: {e}"))
+            };
+
+            let first = query_disk()?;
+            let first_bus = first.bus_type.as_deref().unwrap_or("");
+            let first_id = first.unique_id.as_deref().unwrap_or("");
+            let first_size = first.size.unwrap_or(0);
+            if first.number != disk_number
+                || !windows_disk_is_eligible(first_bus, first.is_boot.unwrap_or(false), first.is_system.unwrap_or(false), first_id, first_size)
+                || !windows_disk_identity_matches(first_id, &expected_unique_id)
+            {
+                return Err("The selected device no longer matches the exact external USB identity. Nothing was written.".into());
+            }
+
+            let image = inspect_image_sync(image_path.clone(), None)?;
+            if !image.sha256.eq_ignore_ascii_case(expected_sha256.trim()) {
+                return Err("The image changed after inspection. Inspect it again before writing. Nothing was written.".into());
+            }
+            if make_bootable && !image.el_torito_boot_record && !image.macos_installer_validated {
+                return Err("Bootable mode requires verified boot metadata in the selected image. Turn off 'Make this drive bootable' to write the image unchanged without bootability checks. Nothing was written.".into());
+            }
+            let raw_extension = matches!(image.extension.to_ascii_lowercase().as_str(), "iso" | "img" | "raw" | "bin" | "dmg" | "dd" | "dsk" | "ima");
+            let recognized_raw_signature = image.apple_partition_map_signature || image.el_torito_boot_record;
+            if image.udif_signature
+                || matches!(image.extension.to_ascii_lowercase().as_str(), "wim" | "esd" | "vhd" | "vhdx")
+                || (!raw_extension && !recognized_raw_signature)
+            {
+                return Err("This file is not recognized as a directly writable raw disk image. Container conversion is not implemented. Nothing was written.".into());
+            }
+            if image.macos_installer_validated
+                && target_mac_model.as_deref().is_some_and(|model| !model.trim().is_empty())
+                && !target_model_is_supported(&image.macos_supported_models, target_mac_model.as_deref())
+            {
+                return Err("Choose a target Mac model explicitly from the installer’s verified compatibility list. Nothing was written.".into());
+            }
+            if image.size_bytes == 0 || image.size_bytes > first_size {
+                return Err("The image is empty or larger than the selected USB drive. Nothing was written.".into());
+            }
+            validate_erase_confirmation(disk_number, first_id, &image.sha256, &confirmation_phrase)?;
+
+            // Re-open and hash the source before touching the destination.
+            let mut source = open_verified_source_image(&image_path, image.size_bytes, &image.sha256)?;
+
+            // Last-moment identity check: disk number reuse or device replacement blocks the write.
+            let current = query_disk()?;
+            let current_bus = current.bus_type.as_deref().unwrap_or("");
+            let current_id = current.unique_id.as_deref().unwrap_or("");
+            let current_size = current.size.unwrap_or(0);
+            if current.number != disk_number
+                || !windows_disk_is_eligible(current_bus, current.is_boot.unwrap_or(false), current.is_system.unwrap_or(false), current_id, current_size)
+                || !windows_disk_identity_matches(current_id, &expected_unique_id)
+                || current_size < image.size_bytes
+            {
+                return Err("The USB identity, safety status, or capacity changed immediately before opening the device. Nothing was written.".into());
+            }
+
+            // Lock and dismount every mounted volume backed by this USB before raw access.
+            // Keep the handles alive until the write and read-back have both completed.
+            let _locked_volumes = lock_windows_volumes_for_disk(disk_number)?;
+            // Locking can take time; re-query identity once more after the volumes are held.
+            let locked_identity = query_disk()?;
+            if locked_identity.number != disk_number
+                || !windows_disk_identity_matches(
+                    locked_identity.unique_id.as_deref().unwrap_or(""),
+                    &expected_unique_id,
+                )
+                || !windows_disk_is_eligible(
+                    locked_identity.bus_type.as_deref().unwrap_or(""),
+                    locked_identity.is_boot.unwrap_or(false),
+                    locked_identity.is_system.unwrap_or(false),
+                    locked_identity.unique_id.as_deref().unwrap_or(""),
+                    locked_identity.size.unwrap_or(0),
+                )
+                || locked_identity.size.unwrap_or(0) < image.size_bytes
+            {
+                return Err("USB identity, capacity, or safety status changed while locking its volumes. Nothing was written.".into());
+            }
+            let locked_id = locked_identity.unique_id.as_deref().unwrap_or("");
+            let locked_size = locked_identity.size.unwrap_or(0);
+            let mut destination = open_raw_device_exclusive(disk_number)?;
+            windows_volume_lock::verify_physical_disk_handle(&destination, disk_number)?;
+            let verified_hash = write_verified_stream(
+                &mut source,
+                &mut destination,
+                image.size_bytes,
+                locked_size,
+                disk_number,
+                locked_id,
+                &image.sha256,
+                &confirmation_phrase,
+                || USB_WRITE_CANCELLED.load(Ordering::SeqCst),
+                |written| { let _ = app.emit("usb-write-progress", written); },
+            )?;
+            let _ = app.emit("usb-write-complete", verified_hash.clone());
+            Ok(format!("USB image written and read-back SHA-256 verified: {verified_hash}. Use Windows Safely Remove Hardware before disconnecting the drive."))
+        })
+        .await
+        .map_err(|e| format!("USB writing task failed: {e}"))?
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (
+            app,
+            disk_number,
+            expected_unique_id,
+            image_path,
+            expected_sha256,
+            confirmation_phrase,
+            target_mac_model,
+        );
+        Err(
+            "macOS raw-device writing is not yet implemented in this build. No data was written."
+                .into(),
+        )
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (
+            app,
+            disk_number,
+            expected_unique_id,
+            image_path,
+            expected_sha256,
+            confirmation_phrase,
+            target_mac_model,
+        );
+        Err("Physical USB writing is supported only on Windows and macOS.".into())
+    }
+}
+
+#[tauri::command]
+fn cancel_usb_write() {
+    USB_WRITE_CANCELLED.store(true, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn restart_as_administrator(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                window: *mut std::ffi::c_void,
+                operation: *const u16,
+                file: *const u16,
+                parameters: *const u16,
+                directory: *const u16,
+                show_command: i32,
+            ) -> *mut std::ffi::c_void;
+        }
+        let executable = std::env::current_exe()
+            .map_err(|e| format!("Could not locate AllBoot to restart it: {e}"))?;
+        let file = executable
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let operation = "runas".encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+        } as isize;
+        if result <= 32 {
+            return Err(format!("Windows did not start the elevated AllBoot process (ShellExecute result {result}). No USB data was written."));
+        }
+        app.exit(0);
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Err("Restart-as-administrator is available only on Windows.".into())
     }
 }
 
@@ -2404,15 +2904,15 @@ mod tests {
     fn write_readiness_never_confuses_preflight_with_write_support() {
         assert!(
             image_write_readiness("iso", true, false, false, false, false, false)
-                .starts_with("Candidate only")
+                .contains("El Torito boot metadata was detected")
         );
         assert!(
             image_write_readiness("iso", false, false, false, false, false, false)
-                .contains("no El Torito")
+                .contains("No El Torito boot record")
         );
         assert!(
             image_write_readiness("dmg", false, true, false, false, false, false)
-                .contains("Apple's installer")
+                .contains("Apple's compressed UDIF container")
         );
         assert!(
             image_write_readiness("wim", false, false, false, false, false, false)
@@ -2424,19 +2924,19 @@ mod tests {
         );
         assert!(
             image_write_readiness("img", false, false, false, false, false, false)
-                .contains("partition layout")
+                .contains("Direct byte-for-byte raw-image writing is available")
         );
         assert!(
             image_write_readiness("unknown", false, false, false, false, false, false)
-                .contains("not supported")
+                .contains("not recognized as a supported raw disk image")
         );
         assert!(
             image_write_readiness("iso", false, false, true, true, false, false)
-                .contains("could not be validated")
+                .contains("not verified")
         );
         assert!(
             image_write_readiness("iso", false, false, true, true, true, false)
-                .contains("supported target Mac model has not been selected")
+                .contains("target-model selection is optional")
         );
         assert!(
             image_write_readiness("iso", false, false, true, true, true, true)
@@ -2444,7 +2944,7 @@ mod tests {
         );
         assert!(
             image_write_readiness("iso", false, false, true, false, false, false)
-                .contains("valid HFS+")
+                .contains("filesystem and bootability are unverified")
         );
     }
 
@@ -2454,7 +2954,7 @@ mod tests {
             image_write_compatibility("iso", true, true, false).starts_with("raw-image candidate")
         );
         assert!(image_write_compatibility("dmg", false, false, true)
-            .contains("macOS installer workflow"));
+            .contains("compressed UDIF container"));
         assert!(image_write_compatibility("wim", false, false, false).contains("not eligible"));
         assert!(image_write_compatibility("vhdx", false, false, false).contains("not eligible"));
         assert!(image_write_compatibility("iso", true, false, false).contains("unconfirmed"));
@@ -2836,6 +3336,7 @@ mod tests {
             image.path,
             image.sha256,
             None,
+            true,
         )
         .expect("real USB identity and image hash should pass read-only preflight");
         assert_eq!(report.disk_number, disk_number);
@@ -2883,6 +3384,7 @@ mod tests {
                     .unwrap()
                     .sha256,
                 None,
+                false,
             )
             .expect("matching USB identity should pass read-only preflight");
             assert_eq!(report.disk_number, drive.disk_number);
@@ -2898,6 +3400,7 @@ mod tests {
                     .unwrap()
                     .sha256,
                 None,
+                false,
             );
             assert!(mismatch.is_err(), "changed device identity must be blocked");
             fs::remove_file(path).unwrap();
@@ -3539,7 +4042,10 @@ fn main() {
             drive_helper_installed,
             install_drive_helper,
             inspect_image,
-            preflight_write
+            preflight_write,
+            write_image_to_drive,
+            cancel_usb_write,
+            restart_as_administrator
         ])
         .run(tauri::generate_context!())
         .expect("error while running AllBoot ISO Maker");

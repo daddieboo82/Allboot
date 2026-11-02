@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AllBoot ISO Maker",
+  "productName": "AllBoot image writer",
   "version": "0.1.0",
   "identifier": "com.nalibase.allboot",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "AllBoot ISO Maker",
+        "title": "AllBoot image writer",
         "width": 1280,
         "height": 860,
         "minWidth": 900,
@@ -28,7 +28,7 @@
     "active": true,
     "icon": ["icons/icon.ico", "icons/icon.png", "icons/icon.icns"],
     "category": "Utility",
-    "shortDescription": "Guided bootable USB creation",
-    "longDescription": "Prepare and inspect bootable media with device identity checks and verification."
+    "shortDescription": "AllBoot image writer — create bootable drives",
+    "longDescription": "AllBoot image writer prepares bootable USB, HDD and SSD media with image inspection, device identity checks and verification."
   }
 }
