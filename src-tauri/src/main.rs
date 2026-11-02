@@ -126,6 +126,15 @@ fn windows_disk_is_eligible(
         && !unique_id.trim().is_empty()
         && size_bytes > 0
 }
+#[cfg(any(target_os = "windows", test))]
+fn windows_disk_identity_matches(actual_unique_id: &str, expected_unique_id: &str) -> bool {
+    !actual_unique_id.trim().is_empty()
+        && !expected_unique_id.trim().is_empty()
+        && actual_unique_id
+            .trim()
+            .eq_ignore_ascii_case(expected_unique_id.trim())
+}
+
 fn valid_el_torito_catalog(boot_record: &[u8], catalog: &[u8]) -> bool {
     if boot_record.len() < 75 || catalog.len() < 64 {
         return false;
@@ -2067,9 +2076,7 @@ fn preflight_write(
         ) {
             return Err("The selected USB disk no longer meets AllBoot's identity, capacity, or system-disk safety checks. Nothing was written.".into());
         }
-        if expected_unique_id.trim().is_empty()
-            || !actual_id.eq_ignore_ascii_case(expected_unique_id.trim())
-        {
+        if !windows_disk_identity_matches(&actual_id, &expected_unique_id) {
             return Err("The selected USB device identity changed since selection. Scan again and re-select the intended drive. Nothing was written.".into());
         }
         let disk_size = disk.size.unwrap_or(0);
@@ -2510,6 +2517,25 @@ mod tests {
             0
         ));
     }
+    #[test]
+    fn windows_disk_identity_requires_exact_nonempty_stable_match() {
+        assert!(windows_disk_identity_matches(
+            "USB-SERIAL-1",
+            "USB-SERIAL-1"
+        ));
+        assert!(windows_disk_identity_matches(
+            " usb-serial-1 ",
+            "USB-SERIAL-1"
+        ));
+        assert!(!windows_disk_identity_matches(
+            "USB-SERIAL-2",
+            "USB-SERIAL-1"
+        ));
+        assert!(!windows_disk_identity_matches("", "USB-SERIAL-1"));
+        assert!(!windows_disk_identity_matches("USB-SERIAL-1", ""));
+        assert!(!windows_disk_identity_matches("   ", "USB-SERIAL-1"));
+    }
+
     #[test]
     fn macos_disk_eligibility_requires_every_safety_condition() {
         assert!(macos_disk_is_eligible(
