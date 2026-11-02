@@ -1,0 +1,73 @@
+name: Cross-platform desktop builds
+
+on:
+  push:
+    branches: [feature/native-drive-discovery]
+  pull_request:
+    branches: [main, master, feature/native-drive-discovery]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+            artifact: windows
+          - os: macos-latest
+            platform: macOS
+            artifact: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Print toolchain versions
+        run: |
+          node --version
+          npm --version
+          rustc --version
+          cargo --version
+
+      - name: Install JavaScript dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Check Rust formatting
+        working-directory: src-tauri
+        run: cargo fmt -- --check
+
+      - name: Build frontend production bundle
+        run: npm run build
+
+      - name: Run native tests
+        working-directory: src-tauri
+        run: cargo test --locked --verbose
+
+      - name: Build native desktop installers
+        run: npm run tauri:build
+
+      - name: List generated installers
+        shell: bash
+        run: |
+          find src-tauri/target/release/bundle -maxdepth 4 -type f -print
+
+      - name: Upload platform installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: AllBoot-${{ matrix.artifact }}
+          path: src-tauri/target/release/bundle/**
+          if-no-files-found: error
