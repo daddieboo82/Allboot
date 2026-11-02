@@ -580,11 +580,17 @@ fn btree_leaf_records(
     let node_size = be_u16(&header_record, 18)? as usize;
     let total_nodes = be_u32(&header_record, 22)? as u64;
     let tree_bytes = (node_size as u64).checked_mul(total_nodes)?;
+    // Treat filesystem metadata as untrusted input. A malformed image can claim
+    // enormous B-trees and otherwise force excessive allocation or CPU use while
+    // the user is only trying to inspect an image.
+    const MAX_BTREE_SCAN_BYTES: u64 = 128 * 1024 * 1024;
+    const MAX_BTREE_RECORDS: usize = 250_000;
     if node_size < 512
         || node_size > 65_536
         || total_nodes == 0
         || total_nodes > 1_000_000
         || tree_bytes > logical_size
+        || tree_bytes > MAX_BTREE_SCAN_BYTES
         || base.checked_add(tree_bytes)? > image_size
         || first_leaf >= total_nodes
     {
@@ -621,6 +627,9 @@ fn btree_leaf_records(
             let start = offsets[index];
             let end = offsets[index + 1];
             if start < 14 || start >= end || end > table_start {
+                return None;
+            }
+            if records.len() >= MAX_BTREE_RECORDS {
                 return None;
             }
             records.push(raw[start..end].to_vec());
@@ -1754,7 +1763,9 @@ fn inspect_image_sync(
         .to_string();
 
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
+    // A larger sequential buffer reduces per-read overhead for multi-gigabyte
+    // installers while keeping memory use bounded to a few MiB.
+    let mut buffer = vec![0_u8; 4 * 1024 * 1024];
     let total_bytes = metadata.len().max(1);
     let mut processed_bytes = 0_u64;
     let mut last_percent = u8::MAX;
@@ -1845,6 +1856,13 @@ fn inspect_image_sync(
 
     let (apple_partition_map_signature, hfs_plus_signature) =
         inspect_apple_partitioned_hfs(&mut file, metadata.len());
+    if let Some(app) = &progress_app {
+        use tauri::Emitter;
+        let _ = app.emit(
+            "image-inspection-progress",
+            "Checking Apple boot metadata, EFI loader, and macOS installer payloads…",
+        );
+    }
     let macos_boot = inspect_macos_boot_structure(&mut file, metadata.len());
 
     let detected_format = if udif_signature {
@@ -2169,6 +2187,45 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn rejects_oversized_hfs_btree_before_scanning_or_allocating_records() {
+        let path = std::env::temp_dir().join(format!(
+            "allboot-oversized-btree-{}-{}.img",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let node_size = 65_536_u64;
+        let total_nodes = 2_049_u64;
+        let tree_bytes = node_size * total_nodes;
+        let file = fs::File::create(&path).expect("create sparse B-tree fixture");
+        file.set_len(tree_bytes)
+            .expect("size sparse B-tree fixture");
+        drop(file);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open B-tree fixture");
+        let mut descriptor = [0_u8; 14];
+        descriptor[8] = 1;
+        file.write_all(&descriptor)
+            .expect("write B-tree descriptor");
+        let mut header = [0_u8; 30];
+        header[10..14].copy_from_slice(&1_u32.to_be_bytes());
+        header[18..20].copy_from_slice(&(node_size as u16).to_be_bytes());
+        header[22..26].copy_from_slice(&(total_nodes as u32).to_be_bytes());
+        file.seek(SeekFrom::Start(14))
+            .expect("seek to B-tree header");
+        file.write_all(&header).expect("write B-tree header");
+        drop(file);
+
+        let mut file = fs::File::open(&path).expect("open sparse B-tree fixture for inspection");
+        assert!(btree_leaf_records(&mut file, 0, tree_bytes, tree_bytes).is_none());
+        fs::remove_file(path).expect("remove sparse B-tree fixture");
+    }
 
     #[test]
     fn validates_el_torito_catalog_checksum_signature_and_boot_entry() {
