@@ -3025,6 +3025,42 @@ mod tests {
     }
 
     #[test]
+    fn physical_device_readback_accepts_image_prefix_and_ignores_remaining_capacity() {
+        let image = b"boot image bytes";
+        let hash = format!("{:x}", Sha256::digest(image));
+        let mut disk_bytes = image.to_vec();
+        disk_bytes.extend_from_slice(&vec![0xD3; 8192]);
+        let mut reader = std::io::Cursor::new(disk_bytes);
+        assert_eq!(
+            verify_device_readback_prefix(&mut reader, image.len() as u64, &hash).unwrap(),
+            hash
+        );
+        assert_eq!(reader.position(), image.len() as u64);
+    }
+
+    #[test]
+    fn physical_device_readback_rejects_truncated_image_and_corrupt_image_region() {
+        let image = b"boot image bytes";
+        let hash = format!("{:x}", Sha256::digest(image));
+        let mut truncated = std::io::Cursor::new(image[..5].to_vec());
+        assert!(
+            verify_device_readback_prefix(&mut truncated, image.len() as u64, &hash)
+                .unwrap_err()
+                .contains("ended early")
+        );
+
+        let mut corrupted = image.to_vec();
+        corrupted[3] ^= 0x80;
+        corrupted.extend_from_slice(&vec![0xD3; 8192]);
+        let mut reader = std::io::Cursor::new(corrupted);
+        assert!(
+            verify_device_readback_prefix(&mut reader, image.len() as u64, &hash)
+                .unwrap_err()
+                .contains("SHA-256 mismatch")
+        );
+    }
+
+    #[test]
     fn verified_write_pipeline_streams_and_reads_back_exact_image() {
         let bytes = b"AllBoot verified writer integration fixture";
         let hash = format!("{:x}", Sha256::digest(bytes));
